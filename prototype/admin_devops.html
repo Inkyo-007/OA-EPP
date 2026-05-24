@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OA-EPP · 教师端 · 开发运维</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-50 min-h-screen flex">
+
+  <!-- Sidebar (Teacher, same as admin_students) -->
+  <aside class="w-56 bg-white border-r border-gray-200 flex flex-col min-h-screen fixed left-0 top-0">
+    <div class="px-5 py-5 border-b border-gray-100">
+      <div class="flex items-center gap-2.5">
+        <div class="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center">
+          <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4M7.835 4.697a3.42 3.42 0 001.946-.806 3.42 3.42 0 014.438 0 3.42 3.42 0 001.946.806 3.42 3.42 0 013.138 3.138 3.42 3.42 0 00.806 1.946 3.42 3.42 0 010 4.438 3.42 3.42 0 00-.806 1.946 3.42 3.42 0 01-3.138 3.138 3.42 3.42 0 00-1.946.806 3.42 3.42 0 01-4.438 0 3.42 3.42 0 00-1.946-.806 3.42 3.42 0 01-3.138-3.138 3.42 3.42 0 00-.806-1.946 3.42 3.42 0 010-4.438 3.42 3.42 0 00.806-1.946 3.42 3.42 0 013.138-3.138z"/>
+          </svg>
+        </div>
+        <div>
+          <span class="font-bold text-gray-800 text-sm">OA-EPP</span>
+          <span class="ml-1.5 text-xs bg-indigo-100 text-indigo-600 px-1.5 py-0.5 rounded">教师端</span>
+        </div>
+      </div>
+    </div>
+    <nav class="flex-1 px-3 py-4 space-y-1">
+      <a href="admin_students.html" class="flex items-center gap-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50 text-sm">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"/></svg>
+        学生管理
+      </a>
+      <a href="admin_devops.html" class="flex items-center gap-3 px-3 py-2 rounded-lg bg-indigo-50 text-indigo-700 font-medium text-sm">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+        开发运维
+      </a>
+      <a href="#" class="flex items-center gap-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50 text-sm">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
+        成绩管理
+      </a>
+      <a href="#" class="flex items-center gap-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50 text-sm">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
+        需求文档编辑
+      </a>
+    </nav>
+    <div class="px-4 py-4 border-t border-gray-100">
+      <div class="flex items-center gap-3">
+        <div class="w-8 h-8 rounded-full bg-indigo-100 flex items-center justify-center text-indigo-700 font-bold text-sm">李</div>
+        <div class="flex-1 min-w-0">
+          <p class="text-sm font-medium text-gray-800 truncate">李四（教师）</p>
+          <p class="text-xs text-gray-400 truncate">admin</p>
+        </div>
+      </div>
+      <a href="login.html" class="mt-3 block text-center text-xs text-gray-400 hover:text-red-500 transition">退出登录</a>
+    </div>
+  </aside>
+
+  <main class="ml-56 flex-1 p-8">
+    <div class="mb-6">
+      <h1 class="text-xl font-bold text-gray-800">开发运维</h1>
+      <p class="text-sm text-gray-400 mt-0.5">仓库配置 · CI/CD · GitHub 快捷链接 · AI 提示词管理</p>
+    </div>
+
+    <div class="grid grid-cols-3 gap-6">
+      <!-- Left: Script Console + GitHub Quick Links -->
+      <div class="col-span-2 space-y-6">
+
+        <!-- Auto Config Wizard -->
+        <div class="bg-white rounded-xl border border-gray-100 shadow-sm p-5">
+          <div class="flex items-center justify-between mb-4">
+            <h3 class="text-sm font-semibold text-gray-700">仓库一键初始化向导</h3>
+            <div class="flex items-center gap-2 text-xs text-gray-400">
+              <span class="w-2 h-2 rounded-full bg-green-500 inline-block"></span>
+              Step 3/8 已完成
+            </div>
+          </div>
+          <!-- Steps -->
+          <div class="space-y-2 mb-4">
+            <div class="flex items-center gap-3 text-xs">
+              <span class="w-5 h-5 rounded-full bg-green-500 text-white flex items-center justify-center text-xs flex-shrink-0">✓</span>
+              <span class="text-gray-500">创建 GitHub 仓库</span>
+            </div>
+            <div class="flex items-center gap-3 text-xs">
+              <span class="w-5 h-5 rounded-full bg-green-500 text-white flex items-center justify-center text-xs flex-shrink-0">✓</span>
+              <span class="text-gray-500">配置 .gitignore 与开源协议</span>
+            </div>
+            <div class="flex items-center gap-3 text-xs">
+              <span class="w-5 h-5 rounded-full bg-green-500 text-white flex items-center justify-center text-xs flex-shrink-0">✓</span>
+              <span class="text-gray-500">设置分支保护规则</span>
+            </div>
+            <div class="flex items-center gap-3 text-xs">
+              <span class="w-5 h-5 rounded-full bg-blue-500 text-white flex items-center justify-center text-xs animate-pulse flex-shrink-0">4</span>
+              <span class="text-blue-700 font-medium">注入 GitHub Secrets ← 进行中</span>
+            </div>
+            <div class="flex items-center gap-3 text-xs">
+              <span class="w-5 h-5 rounded-full bg-gray-200 text-gray-400 flex items-center justify-center text-xs flex-shrink-0">5</span>
+              <span class="text-gray-400">配置 VS Code 扩展列表</span>
+            </div>
+            <div class="flex items-center gap-3 text-xs">
+              <span class="w-5 h-5 rounded-full bg-gray-200 text-gray-400 flex items-center justify-center text-xs flex-shrink-0">6</span>
+              <span class="text-gray-400">配置 Copilot Instructions</span>
+            </div>
+            <div class="flex items-center gap-3 text-xs">
+              <span class="w-5 h-5 rounded-full bg-gray-200 text-gray-400 flex items-center justify-center text-xs flex-shrink-0">7</span>
+              <span class="text-gray-400">配置 CI/CD Actions</span>
+            </div>
+            <div class="flex items-center gap-3 text-xs">
+              <span class="w-5 h-5 rounded-full bg-gray-200 text-gray-400 flex items-center justify-center text-xs flex-shrink-0">8</span>
+              <span class="text-gray-400">Coolify 部署配置</span>
+            </div>
+          </div>
+
+          <!-- Console Output -->
+          <div class="bg-gray-900 rounded-lg p-4 font-mono text-xs text-green-400 h-36 overflow-y-auto">
+            <p><span class="text-gray-500">$</span> gh secret set DATABASE_URL --body "..."</p>
+            <p class="text-green-400">✓ Secret DATABASE_URL set for roboticsystem/OA-EPP</p>
+            <p><span class="text-gray-500">$</span> gh secret set SESSION_SECRET --body "..."</p>
+            <p class="text-green-400">✓ Secret SESSION_SECRET set for roboticsystem/OA-EPP</p>
+            <p><span class="text-gray-500 animate-pulse">$</span><span class="text-yellow-400 animate-pulse"> 正在注入 DEPLOY_TOKEN...</span></p>
+          </div>
+          <div class="flex gap-3 mt-3">
+            <button class="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs px-4 py-2 rounded-lg transition">
+              继续下一步
+            </button>
+            <button class="flex items-center gap-2 border border-gray-200 text-gray-600 text-xs px-4 py-2 rounded-lg hover:bg-gray-50 transition">
+              重试当前步骤
+            </button>
+          </div>
+        </div>
+
+        <!-- Issue Close PR Rule -->
+        <div class="bg-white rounded-xl border border-gray-100 shadow-sm p-5">
+          <div class="flex items-center justify-between mb-3">
+            <h3 class="text-sm font-semibold text-gray-700">关闭 Issue 必须关联 PR</h3>
+            <!-- Toggle -->
+            <div class="flex items-center gap-2">
+              <span class="text-xs text-gray-500">规则已开启</span>
+              <div class="relative w-10 h-5">
+                <div class="w-10 h-5 bg-blue-500 rounded-full"></div>
+                <div class="absolute top-0.5 right-0.5 w-4 h-4 bg-white rounded-full shadow"></div>
+              </div>
+            </div>
+          </div>
+          <p class="text-xs text-gray-400 mb-3">所有角色在 OAEPP 内关闭 Issue 时必须填写关联 PR 编号（实时校验）。通过 GitHub Web 绕过的关闭将在后台生成警告记录。</p>
+          <div class="bg-orange-50 border border-orange-100 rounded-lg px-4 py-3">
+            <p class="text-xs text-orange-700 font-medium">⚠ 近期警告：3 条 Issue 通过 GitHub Web 直接关闭（未填写 PR），请复查。</p>
+            <a href="#" class="text-xs text-orange-600 hover:underline mt-1 inline-block">查看警告记录 →</a>
+          </div>
+        </div>
+
+        <!-- AI Code Review Prompt -->
+        <div class="bg-white rounded-xl border border-gray-100 shadow-sm p-5">
+          <div class="flex items-center justify-between mb-4">
+            <h3 class="text-sm font-semibold text-gray-700">AI 代码审查提示词</h3>
+            <div class="flex gap-2">
+              <button class="text-xs border border-gray-200 text-gray-600 px-3 py-1.5 rounded-lg hover:bg-gray-50">验证配置</button>
+              <button class="text-xs bg-indigo-600 text-white px-3 py-1.5 rounded-lg hover:bg-indigo-700">保存并应用</button>
+            </div>
+          </div>
+          <!-- Template selector -->
+          <div class="flex gap-2 mb-3">
+            <button class="text-xs bg-indigo-100 text-indigo-700 px-3 py-1 rounded-full">代码审查（当前）</button>
+            <button class="text-xs bg-gray-100 text-gray-600 px-3 py-1 rounded-full hover:bg-gray-200">PR 描述总结</button>
+            <button class="text-xs bg-gray-100 text-gray-600 px-3 py-1 rounded-full hover:bg-gray-200">安全全面审查</button>
+          </div>
+          <textarea rows="6"
+            class="w-full border border-gray-200 rounded-lg px-3 py-2.5 text-xs font-mono text-gray-700 focus:outline-none focus:ring-2 focus:ring-indigo-400 resize-none">你是一位严格的代码审查专家，遵循以下规范审查 PR：
+
+1. 代码规范：遵循 Ruff 格式化规范，变量命名使用 snake_case
+2. 安全检查：检查 SQL 注入、硬编码 Secrets、未授权访问风险
+3. Reflex 特定：State 事件处理器不能包含阻塞 I/O；rx.Model 查询须在事件中执行
+4. 架构质量：服务层职责清晰，避免 State 类过重
+
+变更内容：{diff}
+PR 标题：{pr_title}
+PR 描述：{pr_description}</textarea>
+          <p class="text-xs text-gray-400 mt-2">可用变量：<code class="bg-gray-100 px-1 rounded">{diff}</code> <code class="bg-gray-100 px-1 rounded">{pr_title}</code> <code class="bg-gray-100 px-1 rounded">{pr_description}</code> · 文件路径：<code class="bg-gray-100 px-1 rounded">.github/review-prompts/code-review.prompt.md</code></p>
+        </div>
+      </div>
+
+      <!-- Right: GitHub Quick Links -->
+      <div class="space-y-5">
+        <div class="bg-white rounded-xl border border-gray-100 shadow-sm p-5">
+          <h3 class="text-sm font-semibold text-gray-700 mb-4">GitHub 快捷链接</h3>
+          <div class="space-y-2">
+            <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-gray-100 hover:border-indigo-200 hover:bg-indigo-50 transition text-sm text-gray-700 group">
+              <svg class="w-4 h-4 text-gray-400 group-hover:text-indigo-500" fill="currentColor" viewBox="0 0 24 24"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
+              仓库主页
+            </a>
+            <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-gray-100 hover:border-indigo-200 hover:bg-indigo-50 transition text-sm text-gray-700 group">
+              <svg class="w-4 h-4 text-gray-400 group-hover:text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"/></svg>
+              Pull Requests
+            </a>
+            <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-gray-100 hover:border-indigo-200 hover:bg-indigo-50 transition text-sm text-gray-700 group">
+              <svg class="w-4 h-4 text-gray-400 group-hover:text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+              Issues
+            </a>
+            <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-gray-100 hover:border-indigo-200 hover:bg-indigo-50 transition text-sm text-gray-700 group">
+              <svg class="w-4 h-4 text-gray-400 group-hover:text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+              Actions / CI
+            </a>
+            <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-gray-100 hover:border-indigo-200 hover:bg-indigo-50 transition text-sm text-gray-700 group">
+              <svg class="w-4 h-4 text-gray-400 group-hover:text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"/></svg>
+              分支管理
+            </a>
+            <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-gray-100 hover:border-indigo-200 hover:bg-indigo-50 transition text-sm text-gray-700 group">
+              <svg class="w-4 h-4 text-gray-400 group-hover:text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/></svg>
+              Settings · Secrets
+            </a>
+            <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-gray-100 hover:border-indigo-200 hover:bg-indigo-50 transition text-sm text-gray-700 group">
+              <svg class="w-4 h-4 text-gray-400 group-hover:text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
+              Settings · 分支保护
+            </a>
+          </div>
+        </div>
+
+        <!-- CI Status Card -->
+        <div class="bg-white rounded-xl border border-gray-100 shadow-sm p-5">
+          <h3 class="text-sm font-semibold text-gray-700 mb-3">最近 CI 状态</h3>
+          <div class="space-y-2.5">
+            <div class="flex items-center gap-3">
+              <span class="w-2 h-2 rounded-full bg-green-500 flex-shrink-0"></span>
+              <div class="flex-1 min-w-0">
+                <p class="text-xs text-gray-700 truncate">feat: 新增成绩导出功能</p>
+                <p class="text-xs text-gray-400">main · 2 分钟前</p>
+              </div>
+              <span class="text-xs text-green-600 font-medium">通过</span>
+            </div>
+            <div class="flex items-center gap-3">
+              <span class="w-2 h-2 rounded-full bg-red-500 flex-shrink-0"></span>
+              <div class="flex-1 min-w-0">
+                <p class="text-xs text-gray-700 truncate">fix: 修复作业提交页面样式</p>
+                <p class="text-xs text-gray-400">pr/feature-ui · 1 小时前</p>
+              </div>
+              <span class="text-xs text-red-500 font-medium">失败</span>
+            </div>
+            <div class="flex items-center gap-3">
+              <span class="w-2 h-2 rounded-full bg-green-500 flex-shrink-0"></span>
+              <div class="flex-1 min-w-0">
+                <p class="text-xs text-gray-700 truncate">docs: 更新 README</p>
+                <p class="text-xs text-gray-400">main · 3 小时前</p>
+              </div>
+              <span class="text-xs text-green-600 font-medium">通过</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+</body>
+</html>
