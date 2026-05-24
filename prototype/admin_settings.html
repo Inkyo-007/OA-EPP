@@ -49,15 +49,16 @@
     <main class="flex-1 p-6">
       <h1 class="text-xl font-bold text-gray-800 mb-6">系统设置</h1>
 
-      <!-- Tab 切换 -->
+      <!-- Tab 切换（锚链接跳转对应区块）-->
       <div class="flex gap-1 bg-gray-100 p-1 rounded-lg mb-6 w-fit">
-        <button class="px-4 py-1.5 bg-white text-indigo-700 font-medium rounded-md text-sm shadow-sm">学生名单导入</button>
-        <button class="px-4 py-1.5 text-gray-500 hover:text-gray-700 rounded-md text-sm">仓库权限配置</button>
-        <button class="px-4 py-1.5 text-gray-500 hover:text-gray-700 rounded-md text-sm">VS Code 扩展配置</button>
-        <button class="px-4 py-1.5 text-gray-500 hover:text-gray-700 rounded-md text-sm">需求文档编辑器</button>
+        <a href="#tab-import" class="px-4 py-1.5 bg-white text-indigo-700 font-medium rounded-md text-sm shadow-sm no-underline">学生名单导入</a>
+        <a href="#tab-repo" class="px-4 py-1.5 text-gray-500 hover:text-gray-700 rounded-md text-sm no-underline">仓库权限配置</a>
+        <a href="#tab-vscode" class="px-4 py-1.5 text-gray-500 hover:text-gray-700 rounded-md text-sm no-underline">VS Code 扩展配置</a>
+        <a href="#tab-docs" class="px-4 py-1.5 text-gray-500 hover:text-gray-700 rounded-md text-sm no-underline">需求文档编辑器</a>
       </div>
 
       <!-- ===== F-T-005 学生名单导入 ===== -->
+      <div id="tab-import" class="scroll-mt-4">
       <div class="bg-white rounded-xl border border-gray-200 shadow-sm mb-6">
         <div class="px-5 py-4 border-b border-gray-100">
           <h2 class="font-semibold text-gray-800">学生名单导入（F-T-005）</h2>
@@ -146,8 +147,10 @@
           </div>
         </div>
       </div>
+      </div><!-- /#tab-import -->
 
       <!-- ===== F-T-009 仓库权限配置（GitHub Org 模式）===== -->
+      <div id="tab-repo" class="scroll-mt-4">
       <div class="bg-white rounded-xl border border-gray-200 shadow-sm mb-6">
         <div class="px-5 py-4 border-b border-gray-100">
           <h2 class="font-semibold text-gray-800">学生仓库访问权限配置（F-T-009）</h2>
@@ -296,8 +299,10 @@
           </div>
         </div>
       </div>
+      </div><!-- /#tab-repo -->
 
       <!-- ===== F-T-002 VS Code 扩展配置 ===== -->
+      <div id="tab-vscode" class="scroll-mt-4">
       <div class="bg-white rounded-xl border border-gray-200 shadow-sm mb-6">
         <div class="px-5 py-4 border-b border-gray-100">
           <h2 class="font-semibold text-gray-800">VS Code 扩展配置（F-T-002）</h2>
@@ -415,8 +420,10 @@
           </div>
         </div>
       </div>
+      </div><!-- /#tab-vscode -->
 
       <!-- ===== F-T-006 需求文档编辑器 ===== -->
+      <div id="tab-docs" class="scroll-mt-4">
       <div class="bg-white rounded-xl border border-gray-200 shadow-sm">
         <div class="px-5 py-4 border-b border-gray-100 flex items-center justify-between">
           <div>
@@ -521,6 +528,7 @@
           </div>
         </div>
       </div>
+      </div><!-- /#tab-docs -->
     </main>
   </div>
 </body>
