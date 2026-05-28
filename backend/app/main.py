@@ -6,7 +6,8 @@ import os
 
 from app.database import init_db
 from app.sync_exams import sync_exams
-from app.routers import students, auth, exam, teacher
+from app.sync_chapters import sync_chapters
+from app.routers import students, auth, exam, teacher, chapters
 
 app = FastAPI(title="研究生课程《机器人系统》考试系统", docs_url="/api/docs")
 
@@ -21,6 +22,7 @@ app.include_router(students.router)
 app.include_router(auth.router)
 app.include_router(exam.router)
 app.include_router(teacher.router)
+app.include_router(chapters.router)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -35,7 +37,28 @@ def score_page():
     return FileResponse(os.path.join(STATIC_DIR, "score.html"))
 
 
+@app.get("/profile")
+def profile_page():
+    return FileResponse(os.path.join(STATIC_DIR, "profile.html"))
+
+
+@app.get("/courses")
+def courses_page():
+    return FileResponse(os.path.join(STATIC_DIR, "courses.html"))
+
+
+@app.get("/course")
+def course_detail_page():
+    return FileResponse(os.path.join(STATIC_DIR, "course.html"))
+
+
+@app.get("/chapter")
+def chapter_page():
+    return FileResponse(os.path.join(STATIC_DIR, "chapter.html"))
+
+
 @app.on_event("startup")
 def startup():
     init_db()
+    sync_chapters()
     sync_exams()

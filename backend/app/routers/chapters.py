@@ -88,6 +88,34 @@ def get_chapter(chapter_id: str):
     return dict(ch)
 
 
+@router.get("/api/chapters/{chapter_id}/nav")
+def chapter_nav(chapter_id: str):
+    """获取章节的上下导航（上一章/下一章）"""
+    with db() as conn:
+        ch = conn.execute(
+            "SELECT id, course_id, chapter_no FROM chapters WHERE id=?", (chapter_id,)
+        ).fetchone()
+        if not ch:
+            raise HTTPException(status_code=404, detail="章节不存在")
+
+        chapters = conn.execute(
+            "SELECT id, chapter_no, title FROM chapters WHERE course_id=? ORDER BY chapter_no",
+            (ch["course_id"],)
+        ).fetchall()
+
+    prev_ch = None
+    next_ch = None
+    for i, c in enumerate(chapters):
+        if c["id"] == chapter_id:
+            if i > 0:
+                prev_ch = dict(chapters[i - 1])
+            if i < len(chapters) - 1:
+                next_ch = dict(chapters[i + 1])
+            break
+
+    return {"prev": prev_ch, "next": next_ch}
+
+
 @router.get("/api/chapters/{chapter_id}/content")
 def chapter_content(chapter_id: str):
     """获取章节的 Markdown 内容并渲染为 HTML"""
@@ -110,9 +138,22 @@ def chapter_content(chapter_id: str):
     raw = md_path.read_text(encoding="utf-8")
     html_content = markdown.markdown(raw, extensions=["fenced_code", "tables", "codehilite"])
 
+    # 提取章节简介：第一个 `---` 前的文本（去除标题行），转为纯文本预览
+    raw_intro = raw
+    hr_pos = raw.find("\n---\n")
+    if hr_pos != -1:
+        raw_intro = raw[:hr_pos]
+    # 去除第一行 # 标题
+    lines = raw_intro.split("\n")
+    lines = [l for l in lines if not l.startswith("# ") and not l.startswith("#")]
+    intro_text = " ".join(l.strip() for l in lines if l.strip()).strip()
+    if len(intro_text) > 300:
+        intro_text = intro_text[:300] + "…"
+
     return {
         "chapter": dict(ch),
         "content_html": html_content,
+        "intro_text": intro_text,
         "content_raw_len": len(raw),
     }
 
