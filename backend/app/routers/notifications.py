@@ -80,12 +80,14 @@ def create_notification(req: NotificationCreate, authorization: Optional[str] = 
         if not student_ids:
             raise HTTPException(status_code=422, detail="没有目标学生，无法发送通知")
 
-        # 批量插入通知
+        # 批量插入通知（同批次使用统一 created_at，确保分组正确）
+        from datetime import datetime as dt
+        now_str = dt.now().strftime('%Y-%m-%d %H:%M:%S')
         notification_ids = []
         for uid in student_ids:
             cur.execute(
-                "INSERT INTO notifications (user_id, title, body, category) VALUES (%s, %s, %s, %s)",
-                (uid, req.title, req.content, req.category)
+                "INSERT INTO notifications (user_id, title, body, category, created_at) VALUES (%s, %s, %s, %s, %s)",
+                (uid, req.title, req.content, req.category, now_str)
             )
             notification_ids.append(cur.lastrowid)
 
@@ -131,14 +133,26 @@ def update_notification(nid: int, req: NotificationUpdate, authorization: Option
 
 @router.delete("/api/teacher/notifications/{nid}")
 def delete_notification(nid: int, authorization: Optional[str] = Header(None)):
+    """删除通知（按 title+category 批量删除所有学生的同一条通知）"""
     require_teacher(authorization)
     with db() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT id FROM notifications WHERE id = %s", (nid,))
-        if not cur.fetchone():
+        cur.execute(
+            "SELECT id, title, category FROM notifications WHERE id = %s",
+            (nid,)
+        )
+        row = cur.fetchone()
+        if not row:
             raise HTTPException(status_code=404, detail="通知不存在")
-        cur.execute("DELETE FROM notifications WHERE id = %s", (nid,))
-    return {"ok": True}
+
+        # 按 title+category 批量删除整组
+        cur.execute(
+            "DELETE FROM notifications WHERE title = %s AND category = %s",
+            (row["title"], row["category"])
+        )
+        deleted_count = cur.rowcount
+
+    return {"ok": True, "deleted_count": deleted_count}
 
 
 @router.get("/api/teacher/notifications")
@@ -152,20 +166,32 @@ def teacher_list_notifications(
     conditions = []
     params = []
     if category:
-        conditions.append("category = %s")
+        conditions.append("n.category = %s")
         params.append(category)
 
     where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
 
     with db() as conn:
         cur = conn.cursor()
-        cur.execute(f"SELECT COUNT(*) AS cnt FROM notifications{where}", params)
+        # 按标题+分类分组计数
+        cur.execute(
+            f"SELECT COUNT(*) AS cnt FROM ("
+            f"SELECT n.title, n.category "
+            f"FROM notifications n{where} "
+            f"GROUP BY n.title, n.category) AS g",
+            params
+        )
         total = cur.fetchone()["cnt"]
 
+        # 按 title+category 分组，用子查询取代表行
         cur.execute(
-            f"SELECT n.*, u.full_name AS student_name, u.student_no FROM notifications n "
-            f"JOIN users u ON n.user_id = u.id{where} "
-            f"ORDER BY n.created_at DESC LIMIT %s OFFSET %s",
+            f"SELECT g.id, g.title, g.body, g.category, g.created_at, g.total_students, g.read_count FROM ("
+            f"SELECT MIN(n.id) AS id, ANY_VALUE(n.body) AS body, n.title, n.category, "
+            f"MAX(n.created_at) AS created_at, COUNT(*) AS total_students, "
+            f"SUM(CASE WHEN n.is_read=1 THEN 1 ELSE 0 END) AS read_count "
+            f"FROM notifications n {where} "
+            f"GROUP BY n.title, n.category "
+            f"ORDER BY created_at DESC LIMIT %s OFFSET %s) AS g",
             (*params, page_size, (page - 1) * page_size)
         )
         rows = cur.fetchall()
@@ -174,8 +200,6 @@ def teacher_list_notifications(
     for r in rows:
         d = dict(r)
         _datetime_to_str(d, "created_at")
-        d["read_count"] = 1 if d.get("is_read") else 0
-        d["total_students"] = 1
         result.append(d)
 
     return {"items": result, "total": total, "page": page, "page_size": page_size}
@@ -384,3 +408,93 @@ def get_category_stats(authorization: Optional[str] = Header(None)):
         result["all"] = sum(result.values())
 
     return {"category_counts": result}
+
+
+# ──────────────── 公开 API（学生查分页面使用，无需 token）───────────────
+
+@router.get("/api/public/notifications")
+def public_list_notifications(
+    student_id: str = Query(..., min_length=1),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100)
+):
+    """公开接口：通过学号获取通知列表（按 title+category 分组去重）"""
+    with db() as conn:
+        user_id = _get_user_id_by_student_no(conn, student_id)
+        if not user_id:
+            return {"items": [], "total": 0, "unread_count": 0}
+
+        cur = conn.cursor()
+        # 按标题+分类分组计数
+        cur.execute(
+            "SELECT COUNT(*) AS cnt FROM ("
+            "SELECT n.title, n.category "
+            "FROM notifications n WHERE n.user_id = %s "
+            "GROUP BY n.title, n.category) AS g",
+            (user_id,)
+        )
+        total = cur.fetchone()["cnt"]
+
+        # 按 title+category 分组查询，取每组最新的一条代表
+        cur.execute(
+            "SELECT g.id, g.body, g.title, g.category, g.created_at, "
+            "SUM(CASE WHEN g.is_read=1 THEN 1 ELSE 0 END) > 0 AS any_read "
+            "FROM ("
+            "SELECT MIN(n.id) AS id, ANY_VALUE(n.body) AS body, n.title, n.category, "
+            "MAX(n.created_at) AS created_at, MAX(n.is_read) AS is_read "
+            "FROM notifications n WHERE n.user_id = %s "
+            "GROUP BY n.title, n.category "
+            "ORDER BY created_at DESC LIMIT %s OFFSET %s) AS g",
+            (user_id, page_size, (page - 1) * page_size)
+        )
+        rows = cur.fetchall()
+
+        unread_count = _get_unread_count(conn, user_id)
+
+    items = []
+    for r in rows:
+        d = dict(r)
+        d["content"] = d.pop("body", "")
+        d["is_read"] = bool(d.get("any_read", 0))
+        _datetime_to_str(d, "created_at")
+        items.append(d)
+
+    return {"items": items, "total": total, "unread_count": unread_count}
+
+
+@router.get("/api/public/notifications/unread-count")
+def public_unread_count(student_id: str = Query(..., min_length=1)):
+    """公开接口：通过学号获取未读通知数"""
+    with db() as conn:
+        user_id = _get_user_id_by_student_no(conn, student_id)
+        if not user_id:
+            return {"unread_count": 0}
+        unread_count = _get_unread_count(conn, user_id)
+    return {"unread_count": unread_count}
+
+
+@router.post("/api/public/notifications/{nid}/read")
+def public_mark_read(nid: int, student_id: str = Query(..., min_length=1)):
+    """公开接口：标记通知为已读（按 title+category 批量标记该组所有记录）"""
+    with db() as conn:
+        user_id = _get_user_id_by_student_no(conn, student_id)
+        if not user_id:
+            raise HTTPException(status_code=404, detail="学生不存在")
+
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, title, category FROM notifications WHERE id = %s AND user_id = %s",
+            (nid, user_id)
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="通知不存在")
+
+        # 按 title+category 批量标记该组全部为已读
+        cur.execute(
+            "UPDATE notifications SET is_read = 1 WHERE user_id = %s AND title = %s AND category = %s",
+            (user_id, row["title"], row["category"])
+        )
+        unread_count = _get_unread_count(conn, user_id)
+
+    return {"ok": True, "unread_count": unread_count}
