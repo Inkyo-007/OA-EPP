@@ -105,8 +105,23 @@
       <div class="card-body">
         <div id="upload-msg"></div>
         <p style="font-size:.88rem;color:#888;margin-bottom:12px">
-          CSV 格式：<code>姓名,学号,班级</code>（第一行为表头，编码 UTF-8 或 GBK 均支持）
+          CSV 格式：<code>姓名,学号,班级,课程</code>（第一行为表头，编码 UTF-8 或 GBK 均支持）
         </p>
+        
+        <div style="margin-bottom:16px;">
+          <label class="form-label" style="font-weight:bold;margin-bottom:8px;display:block;">导入模式</label>
+          <div style="display:flex;gap:16px;">
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+              <input type="radio" name="import-mode" id="mode-incremental" value="incremental" checked>
+              <span><strong>增量导入</strong>（重复学号跳过，新增追加）</span>
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+              <input type="radio" name="import-mode" id="mode-full" value="full">
+              <span><strong>全量覆盖</strong>（清空现有数据后导入）</span>
+            </label>
+          </div>
+        </div>
+        
         <label class="upload-area" id="upload-area">
           <input type="file" id="csv-file" accept=".csv" onchange="handleFile(this)">
           <div style="font-size:2rem">📂</div>
@@ -116,6 +131,20 @@
         <div style="margin-top:12px">
           <button class="btn btn-success" onclick="uploadStudents()">上传名单</button>
         </div>
+        
+        <div id="upload-result" style="margin-top:16px;display:none;">
+        </div>
+      </div>
+    </div>
+    
+    <!-- 导入日志 -->
+    <div class="card">
+      <div class="card-title">
+        <span>📜 导入日志</span>
+        <button class="btn btn-outline btn-sm" onclick="loadImportLogs()">刷新</button>
+      </div>
+      <div class="card-body">
+        <div id="import-logs">加载中…</div>
       </div>
     </div>
 
@@ -193,6 +222,7 @@ async function doLogin() {
     document.getElementById('app').style.display = 'block';
     loadExams();
     loadStudentList();
+    loadImportLogs();
   } catch(e) { showMsg('login-msg', '网络错误：' + e, 'error'); }
 }
 
@@ -209,8 +239,13 @@ function handleFile(input) {
 async function uploadStudents() {
   const file = document.getElementById('csv-file').files[0];
   if (!file) { showMsg('upload-msg', '请先选择 CSV 文件', 'error'); return; }
+  
+  const importMode = document.querySelector('input[name="import-mode"]:checked').value;
+  
   const fd = new FormData();
   fd.append('file', file);
+  fd.append('import_mode', importMode);
+  
   try {
     const r = await fetch(`${API}/api/teacher/students`, {
       method: 'POST',
@@ -218,11 +253,161 @@ async function uploadStudents() {
       body: fd
     });
     const d = await r.json();
-    if (!r.ok) { showMsg('upload-msg', d.detail || '上传失败', 'error'); return; }
-    showMsg('upload-msg', `✅ 成功导入 ${d.count} 名学生`, 'success');
+    if (!r.ok) { 
+      showMsg('upload-msg', d.detail || '上传失败', 'error'); 
+      return; 
+    }
+    
+    showMsg('upload-msg', `✅ 批次 ${d.batch_id} 导入完成：成功 ${d.success} 条，错误 ${d.errors} 条`, 
+            d.errors > 0 ? 'error' : 'success');
+    
+    const resultDiv = document.getElementById('upload-result');
+    resultDiv.style.display = 'block';
+    
+    let resultHtml = `
+      <div style="padding:16px;background:${d.errors>0?'#fff3f3':'#e8f5e9'};border-radius:8px;">
+        <p style="font-weight:bold;margin-bottom:8px;">
+          导入模式：${d.import_mode === 'incremental' ? '增量导入' : '全量覆盖'}
+        </p>
+        <p style="margin-bottom:8px;">
+          总记录：${d.total} | 成功：<span style="color:#2e7d32;">${d.success}</span> | 
+          错误：<span style="color:#c62828;">${d.errors}</span>
+        </p>
+    `;
+    
+    if (d.error_details && d.error_details.length > 0) {
+      resultHtml += `
+        <div style="margin-top:12px;">
+          <p style="font-weight:bold;color:#c62828;margin-bottom:8px;">错误详情：</p>
+          <table style="width:100%;font-size:.85rem;border-collapse:collapse;">
+            <thead>
+              <tr style="background:#ffebee;">
+                <th style="padding:8px;text-align:left;border:1px solid #ffcdd2;">行号</th>
+                <th style="padding:8px;text-align:left;border:1px solid #ffcdd2;">原始数据</th>
+                <th style="padding:8px;text-align:left;border:1px solid #ffcdd2;">错误信息</th>
+              </tr>
+            </thead>
+            <tbody>
+      `;
+      for (const err of d.error_details.slice(0, 10)) {
+        resultHtml += `
+          <tr>
+            <td style="padding:8px;border:1px solid #ffcdd2;">${err.line}</td>
+            <td style="padding:8px;border:1px solid #ffcdd2;font-family:monospace;font-size:.8rem;">${err.raw_data}</td>
+            <td style="padding:8px;border:1px solid #ffcdd2;color:#c62828;">${err.errors.join('; ')}</td>
+          </tr>
+        `;
+      }
+      if (d.error_details.length > 10) {
+        resultHtml += `<tr><td colspan="3" style="padding:8px;border:1px solid #ffcdd2;text-align:center;color:#888;">...还有 ${d.error_details.length - 10} 条错误</td></tr>`;
+      }
+      resultHtml += `</tbody></table></div>`;
+    }
+    
+    resultHtml += `</div>`;
+    resultDiv.innerHTML = resultHtml;
+    
     loadExams();
     loadStudentList();
-  } catch(e) { showMsg('upload-msg', '网络错误：' + e, 'error'); }
+    loadImportLogs();
+  } catch(e) { 
+    showMsg('upload-msg', '网络错误：' + e, 'error'); 
+  }
+}
+
+async function loadImportLogs() {
+  try {
+    const r = await fetch(`${API}/api/teacher/import-logs`, {
+      headers: {'Authorization': `Bearer ${TOKEN}`}
+    });
+    if (r.status === 401) { logout(); return; }
+    const d = await r.json();
+    const logsDiv = document.getElementById('import-logs');
+    
+    if (!d.logs || d.logs.length === 0) {
+      logsDiv.innerHTML = '<p style="color:#888">暂无导入记录</p>';
+      return;
+    }
+    
+    let html = `
+      <table style="width:100%;font-size:.85rem;">
+        <thead>
+          <tr style="background:#e3f2fd;">
+            <th style="padding:10px 12px;text-align:left;">批次</th>
+            <th style="padding:10px 12px;text-align:left;">模式</th>
+            <th style="padding:10px 12px;text-align:left;">总数</th>
+            <th style="padding:10px 12px;text-align:left;">成功</th>
+            <th style="padding:10px 12px;text-align:left;">错误</th>
+            <th style="padding:10px 12px;text-align:left;">时间</th>
+            <th style="padding:10px 12px;text-align:left;">操作</th>
+          </tr>
+        </thead>
+        <tbody>
+    `;
+    
+    for (const log of d.logs) {
+      const modeLabel = log.import_mode === 'incremental' ? '增量' : '全量';
+      const hasErrors = log.error_count > 0;
+      html += `
+        <tr style="border-bottom:1px solid #f0f0f0;">
+          <td style="padding:10px 12px;font-family:monospace;">${log.batch_id}</td>
+          <td style="padding:10px 12px;">
+            <span class="badge badge-${log.import_mode==='incremental'?'green':'gray'}">${modeLabel}</span>
+          </td>
+          <td style="padding:10px 12px;">${log.total_records}</td>
+          <td style="padding:10px 12px;color:#2e7d32;">${log.success_count}</td>
+          <td style="padding:10px 12px;color:${hasErrors?'#c62828':'#888'};">${log.error_count}</td>
+          <td style="padding:10px 12px;font-size:.8rem;color:#666;">${log.created_at}</td>
+          <td style="padding:10px 12px;">
+            ${hasErrors ? `<button class="btn btn-outline btn-sm" onclick="showImportErrors(${log.id})">查看错误</button>` : '—'}
+          </td>
+        </tr>
+      `;
+    }
+    
+    html += `</tbody></table>`;
+    logsDiv.innerHTML = html;
+  } catch(e) {
+    document.getElementById('import-logs').innerHTML = '<p style="color:#c62828">加载失败</p>';
+  }
+}
+
+async function showImportErrors(logId) {
+  try {
+    const r = await fetch(`${API}/api/teacher/import-logs/${logId}/errors`, {
+      headers: {'Authorization': `Bearer ${TOKEN}`}
+    });
+    const d = await r.json();
+    
+    let html = `
+      <div style="max-height:400px;overflow-y:auto;">
+        <table style="width:100%;font-size:.85rem;">
+          <thead>
+            <tr style="background:#ffebee;position:sticky;top:0;">
+              <th style="padding:8px;text-align:left;border:1px solid #ffcdd2;">行号</th>
+              <th style="padding:8px;text-align:left;border:1px solid #ffcdd2;">原始数据</th>
+              <th style="padding:8px;text-align:left;border:1px solid #ffcdd2;">错误信息</th>
+            </tr>
+          </thead>
+          <tbody>
+    `;
+    
+    for (const err of d.errors) {
+      html += `
+        <tr>
+          <td style="padding:8px;border:1px solid #ffcdd2;">${err.line_number}</td>
+          <td style="padding:8px;border:1px solid #ffcdd2;font-family:monospace;font-size:.8rem;">${err.raw_data}</td>
+          <td style="padding:8px;border:1px solid #ffcdd2;color:#c62828;">${err.error_msg}</td>
+        </tr>
+      `;
+    }
+    
+    html += `</tbody></table></div>`;
+    
+    showConfirmDialog('导入错误详情', html, () => {});
+  } catch(e) {
+    alert('加载错误详情失败：' + e);
+  }
 }
 
 let currentExamId = null;
@@ -443,19 +628,40 @@ function confirmNewSemester() {
 function showConfirmDialog(title, message, onConfirm) {
   const backdrop = document.createElement('div');
   backdrop.className = 'confirm-dialog-backdrop';
+  
+  const hasConfirm = typeof onConfirm === 'function';
+  
   backdrop.innerHTML = `
-    <div class="confirm-dialog">
+    <div class="confirm-dialog" style="${!hasConfirm ? 'max-width:600px;' : ''}">
       <h3>${title}</h3>
       <p>${message}</p>
       <div class="btn-row">
-        <button class="btn btn-outline btn-sm" id="confirm-cancel">取消</button>
-        <button class="btn btn-danger btn-sm" id="confirm-ok">确认执行</button>
+        ${hasConfirm ? `
+          <button class="btn btn-outline btn-sm" id="confirm-cancel">取消</button>
+          <button class="btn btn-danger btn-sm" id="confirm-ok">确认执行</button>
+        ` : `
+          <button class="btn btn-primary btn-sm" id="confirm-ok">关闭</button>
+        `}
       </div>
     </div>
   `;
   document.body.appendChild(backdrop);
-  backdrop.querySelector('#confirm-cancel').onclick = () => backdrop.remove();
-  backdrop.querySelector('#confirm-ok').onclick = () => { backdrop.remove(); onConfirm(); };
+  
+  const cancelBtn = backdrop.querySelector('#confirm-cancel');
+  const okBtn = backdrop.querySelector('#confirm-ok');
+  
+  if (cancelBtn) {
+    cancelBtn.onclick = () => backdrop.remove();
+  }
+  
+  if (okBtn) {
+    okBtn.onclick = () => {
+      backdrop.remove();
+      if (hasConfirm) {
+        onConfirm();
+      }
+    };
+  }
 }
 
 // ───── 初始化：检查已有 token ─────
@@ -467,6 +673,7 @@ if (TOKEN) {
         document.getElementById('app').style.display = 'block';
         loadExams();
         loadStudentList();
+        loadImportLogs();
       } else {
         TOKEN = ''; sessionStorage.removeItem('teacher_token');
       }

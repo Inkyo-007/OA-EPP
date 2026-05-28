@@ -1,10 +1,11 @@
 import os
 import io
+import uuid
 import chardet
 from datetime import datetime
-from fastapi import APIRouter, HTTPException, Header, UploadFile, File, Query
+from fastapi import APIRouter, HTTPException, Header, UploadFile, File, Query, Form
 from fastapi.responses import StreamingResponse
-from typing import Optional
+from typing import Optional, List
 from pydantic import BaseModel
 from app.database import db
 from app.auth_utils import create_token, verify_teacher_token
@@ -49,10 +50,14 @@ def teacher_login(req: LoginRequest):
 @router.post("/api/teacher/students")
 async def upload_students(
     file: UploadFile = File(...),
+    import_mode: str = Form("incremental"),
     authorization: Optional[str] = Header(None)
 ):
-    """上传学生名单 CSV（UTF-8 或 GBK 均支持）"""
+    """上传学生名单 CSV（支持增量/全量模式，UTF-8/GBK编码）"""
     _require_teacher(authorization)
+
+    if import_mode not in ["incremental", "full"]:
+        raise HTTPException(status_code=422, detail="导入模式必须是 incremental 或 full")
 
     raw = await file.read()
     encoding = chardet.detect(raw)["encoding"] or "utf-8"
@@ -62,37 +67,124 @@ async def upload_students(
     if not lines:
         raise HTTPException(status_code=422, detail="文件为空")
 
-    # 跳过表头
-    data_lines = lines[1:] if lines[0].startswith("姓名") or lines[0].startswith("name") else lines
+    data_lines = []
+    header = lines[0].lower() if lines else ""
+    has_header = any(keyword in header for keyword in ["姓名", "name", "学号", "student_id", "班级", "class"])
+    start_idx = 1 if has_header else 0
+    data_lines = lines[start_idx:]
 
-    records = []
-    for line in data_lines:
+    batch_id = str(uuid.uuid4())[:8]
+    errors = []
+    valid_records = []
+    seen_student_ids = set()
+
+    for line_num, line in enumerate(data_lines, start=start_idx + 1):
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 2:
-            continue
-        name = parts[0]
-        student_id = parts[1]
+        
+        name = parts[0] if len(parts) > 0 else ""
+        student_id = parts[1] if len(parts) > 1 else ""
         class_name = parts[2] if len(parts) > 2 else ""
-        if not name or not student_id:
-            continue
-        pinyin, abbr = _name_to_pinyin(name)
-        records.append((name, student_id, class_name, pinyin, abbr))
+        course_name = parts[3] if len(parts) > 3 else ""
 
-    if not records:
+        line_errors = []
+        
+        if not name or len(name) > 50:
+            line_errors.append("姓名字段缺失或过长")
+        if not student_id or len(student_id) > 50:
+            line_errors.append("学号字段缺失或过长")
+        elif student_id in seen_student_ids:
+            line_errors.append("学号在文件中重复")
+        else:
+            seen_student_ids.add(student_id)
+
+        if line_errors:
+            errors.append({
+                "line": line_num,
+                "raw_data": line,
+                "errors": line_errors
+            })
+        else:
+            pinyin, abbr = _name_to_pinyin(name)
+            valid_records.append({
+                "name": name,
+                "student_id": student_id,
+                "class_name": class_name,
+                "course_name": course_name,
+                "pinyin": pinyin,
+                "pinyin_abbr": abbr,
+                "password": student_id
+            })
+
+    if not valid_records and not errors:
         raise HTTPException(status_code=422, detail="CSV 中没有有效数据行")
 
     with db() as conn:
-        conn.executemany("""
-            INSERT INTO students (name, student_id, class_name, pinyin, pinyin_abbr)
-            VALUES (?,?,?,?,?)
-            ON CONFLICT(student_id) DO UPDATE SET
-                name=excluded.name,
-                class_name=excluded.class_name,
-                pinyin=excluded.pinyin,
-                pinyin_abbr=excluded.pinyin_abbr
-        """, records)
+        if import_mode == "full":
+            conn.execute("DELETE FROM scores")
+            conn.execute("DELETE FROM students")
 
-    return {"count": len(records)}
+        success_count = 0
+        for record in valid_records:
+            try:
+                if import_mode == "incremental":
+                    conn.execute("""
+                        INSERT INTO students (name, student_id, class_name, course_name, pinyin, pinyin_abbr, password)
+                        VALUES (?,?,?,?,?,?,?)
+                        ON CONFLICT(student_id) DO UPDATE SET
+                            name=excluded.name,
+                            class_name=excluded.class_name,
+                            course_name=excluded.course_name,
+                            pinyin=excluded.pinyin,
+                            pinyin_abbr=excluded.pinyin_abbr,
+                            password=excluded.password
+                    """, (
+                        record["name"], record["student_id"], record["class_name"],
+                        record["course_name"], record["pinyin"], record["pinyin_abbr"],
+                        record["password"]
+                    ))
+                else:
+                    conn.execute("""
+                        INSERT INTO students (name, student_id, class_name, course_name, pinyin, pinyin_abbr, password)
+                        VALUES (?,?,?,?,?,?,?)
+                    """, (
+                        record["name"], record["student_id"], record["class_name"],
+                        record["course_name"], record["pinyin"], record["pinyin_abbr"],
+                        record["password"]
+                    ))
+                success_count += 1
+            except Exception as e:
+                errors.append({
+                    "line": valid_records.index(record) + start_idx + 1,
+                    "raw_data": ",".join([record["name"], record["student_id"], record["class_name"], record["course_name"]]),
+                    "errors": [str(e)]
+                })
+
+        cursor = conn.execute("""
+            INSERT INTO import_logs (batch_id, import_mode, operator, total_records, success_count, error_count)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            batch_id, import_mode, "teacher", len(data_lines),
+            success_count, len(errors)
+        ))
+        import_log_id = cursor.lastrowid
+
+        for err in errors:
+            conn.execute("""
+                INSERT INTO import_errors (import_log_id, line_number, raw_data, error_msg)
+                VALUES (?, ?, ?, ?)
+            """, (
+                import_log_id, err["line"], err["raw_data"],
+                "; ".join(err["errors"])
+            ))
+
+    return {
+        "batch_id": batch_id,
+        "import_mode": import_mode,
+        "total": len(data_lines),
+        "success": success_count,
+        "errors": len(errors),
+        "error_details": errors
+    }
 
 
 class AddStudentRequest(BaseModel):
@@ -329,3 +421,46 @@ def export_scores(exam_id: str = Query(...), authorization: Optional[str] = Head
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"}
     )
+
+
+@router.get("/api/teacher/import-logs")
+def list_import_logs(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    authorization: Optional[str] = Header(None)
+):
+    """获取导入日志列表"""
+    _require_teacher(authorization)
+    with db() as conn:
+        offset = (page - 1) * page_size
+        logs = conn.execute("""
+            SELECT id, batch_id, import_mode, operator, total_records,
+                   success_count, error_count, created_at
+            FROM import_logs
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+        """, (page_size, offset)).fetchall()
+        total = conn.execute("SELECT COUNT(*) FROM import_logs").fetchone()[0]
+    return {
+        "logs": [dict(l) for l in logs],
+        "total": total,
+        "page": page,
+        "page_size": page_size
+    }
+
+
+@router.get("/api/teacher/import-logs/{log_id}/errors")
+def get_import_errors(
+    log_id: int,
+    authorization: Optional[str] = Header(None)
+):
+    """获取某次导入的错误详情"""
+    _require_teacher(authorization)
+    with db() as conn:
+        errors = conn.execute("""
+            SELECT line_number, raw_data, error_msg
+            FROM import_errors
+            WHERE import_log_id = ?
+            ORDER BY line_number
+        """, (log_id,)).fetchall()
+    return {"errors": [dict(e) for e in errors]}
