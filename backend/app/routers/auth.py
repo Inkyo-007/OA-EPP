@@ -44,15 +44,17 @@ def verify_identity(req: VerifyRequest):
             # 实际考试状态由前端根据列表接口判断
             pass
 
-        # 检查是否已提交成绩（通过 submissions + grading_records）
+        # 检查是否已提交成绩（通过 submissions + grading_records，按 exam_id 筛选）
         cur.execute("""
             SELECT gr.exam_score AS score, gr.total_score AS total, gr.graded_at AS submitted_at
             FROM submissions sub
             JOIN grading_records gr ON sub.id = gr.submission_id
+            JOIN assignments a ON sub.assignment_id = a.id
             WHERE sub.student_user_id = %s
+              AND a.title LIKE CONCAT('exam_', %s, '%%')
             ORDER BY gr.graded_at DESC
             LIMIT 1
-        """, (student["user_id"],))
+        """, (student["user_id"], req.exam_id))
         existing = cur.fetchone()
 
         if existing:

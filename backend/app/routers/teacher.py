@@ -113,9 +113,10 @@ async def upload_students(
                 VALUES ('student', %s, %s, '', %s)
                 ON DUPLICATE KEY UPDATE full_name = VALUES(full_name)
             """, (student_no, email, name))
-            user_id = cur.lastrowid or cur.execute(
-                "SELECT id FROM users WHERE student_no = %s", (student_no,)
-            ) or cur.fetchone()["id"]
+            user_id = cur.lastrowid
+            if not user_id:
+                cur.execute("SELECT id FROM users WHERE student_no = %s", (student_no,))
+                user_id = cur.fetchone()["id"]
 
             # 插入或更新 students 表
             cur.execute("""
@@ -268,26 +269,32 @@ def list_exams(authorization: Optional[str] = Header(None)):
         total_students = _get_enrolled_student_count(conn)
         result = []
         for e in exams:
+            # 统计该考试已提交人数
             cur.execute("""
-                SELECT COUNT(*) AS cnt FROM grading_records gr
+                SELECT COUNT(DISTINCT sub.student_user_id) AS cnt
+                FROM grading_records gr
                 JOIN submissions sub ON gr.submission_id = sub.id
                 JOIN assignments a ON sub.assignment_id = a.id
-                WHERE a.course_id = %s
-            """, (COURSE_ID,))
-            submitted = cur.fetchone()["cnt"]
+                WHERE a.course_id = %s AND a.title LIKE CONCAT('exam_', %s, '%%')
+            """, (COURSE_ID, str(e["id"])))
+            submitted = cur.fetchone()["cnt"] or 0
 
+            # 统计该考试平均分
             cur.execute("""
-                SELECT AVG(gr.exam_score) AS avg FROM grading_records gr
+                SELECT AVG(gr.exam_score) AS avg
+                FROM grading_records gr
                 JOIN submissions sub ON gr.submission_id = sub.id
                 JOIN assignments a ON sub.assignment_id = a.id
-                WHERE a.course_id = %s
-            """, (COURSE_ID,))
+                WHERE a.course_id = %s AND a.title LIKE CONCAT('exam_', %s, '%%')
+            """, (COURSE_ID, str(e["id"])))
             avg_row = cur.fetchone()
             avg = avg_row["avg"]
 
             result.append({
                 "id": str(e["id"]), "title": e["title"], "is_active": 1,
                 "exam_type": e["exam_type"],
+                "start_at": e["start_at"].strftime("%Y-%m-%d %H:%M:%S") if e["start_at"] else None,
+                "end_at": e["end_at"].strftime("%Y-%m-%d %H:%M:%S") if e["end_at"] else None,
                 "submitted": submitted, "total_students": total_students,
                 "avg_score": round(float(avg), 1) if avg else None,
             })
@@ -343,12 +350,14 @@ def get_scores(exam_id: str = Query(...), authorization: Optional[str] = Header(
 
         students = _list_students_with_class(conn)
 
-        # 获取成绩
+        # 获取成绩（通过 assignment.title 关联 exam_id）
         cur.execute("""
             SELECT sub.student_user_id, gr.exam_score AS score, gr.total_score AS total, gr.graded_at AS submitted_at
             FROM grading_records gr
             JOIN submissions sub ON gr.submission_id = sub.id
-        """)
+            JOIN assignments a ON sub.assignment_id = a.id
+            WHERE a.title LIKE CONCAT('exam_', %s, '%%')
+        """, (exam_id,))
         scores_map = {r["student_user_id"]: r for r in cur.fetchall()}
 
     result = []
@@ -384,7 +393,9 @@ def export_scores(exam_id: str = Query(...), authorization: Optional[str] = Head
             SELECT sub.student_user_id, gr.exam_score AS score, gr.total_score AS total, gr.graded_at AS submitted_at
             FROM grading_records gr
             JOIN submissions sub ON gr.submission_id = sub.id
-        """)
+            JOIN assignments a ON sub.assignment_id = a.id
+            WHERE a.title LIKE CONCAT('exam_', %s, '%%')
+        """, (exam_id,))
         scores_map = {r["student_user_id"]: r for r in cur.fetchall()}
 
     wb = openpyxl.Workbook()
