@@ -4,7 +4,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 import os
 
-from app.database import init_db
+from app.database import init_db, seed_timeline_events
 from app.sync_exams import sync_exams
 from app.routers import students, auth, exam, teacher, timeline
 
@@ -40,3 +40,4 @@ def score_page():
 def startup():
     init_db()
     sync_exams()
+    seed_timeline_events()
