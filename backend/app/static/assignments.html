@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OA-EPP · 作业提交（截止规则演示）</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-50 min-h-screen">
+
+  <!-- 顶部 -->
+  <header class="bg-white border-b border-gray-200 px-8 py-4 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <div class="w-9 h-9 bg-blue-600 rounded-lg flex items-center justify-center text-white font-bold">EPP</div>
+      <div>
+        <h1 class="text-base font-bold text-gray-800">OA-EPP · 作业截止规则</h1>
+        <p class="text-xs text-gray-400">F-S-022 截止规则验证</p>
+      </div>
+    </div>
+    <div class="flex items-center gap-3">
+      <label class="text-xs text-gray-500">学号</label>
+      <input id="student-no" value="2024001"
+        class="border rounded-lg px-3 py-1.5 text-sm w-32 focus:outline-none focus:ring-2 focus:ring-blue-400"/>
+      <button onclick="loadAssignments()"
+        class="bg-blue-600 hover:bg-blue-700 text-white text-sm px-4 py-1.5 rounded-lg">刷新</button>
+    </div>
+  </header>
+
+  <main class="p-8">
+    <div id="status" class="mb-4 text-xs text-gray-500"></div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4" id="cards"></div>
+
+    <!-- 提交弹窗 -->
+    <div id="modal" class="hidden fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+      <div class="bg-white rounded-xl w-[420px] p-5 shadow-xl">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="text-sm font-semibold text-gray-800">提交作业</h3>
+          <button onclick="closeModal()" class="text-gray-400">✕</button>
+        </div>
+        <p id="modal-title" class="text-sm text-gray-600 mb-2"></p>
+        <p id="modal-policy" class="text-xs mb-3"></p>
+        <textarea id="text-content" rows="3" placeholder="提交说明 / 文本作业内容..."
+          class="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 resize-none"></textarea>
+        <div class="mt-3 flex justify-end gap-2">
+          <button onclick="closeModal()" class="text-sm px-3 py-1.5 rounded-lg border">取消</button>
+          <button onclick="doSubmit()" class="text-sm px-4 py-1.5 rounded-lg bg-blue-600 text-white">确认提交</button>
+        </div>
+        <p id="submit-result" class="text-xs mt-3"></p>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    const API = 'http://localhost:8000';
+    let currentAssignment = null;
+
+    function policyBadge(p) {
+      const map = {
+        'allow':   { color: 'bg-blue-100 text-blue-700',     label: '允许迟交' },
+        'deny':    { color: 'bg-red-100 text-red-700',       label: '禁止迟交' },
+        'penalty': { color: 'bg-orange-100 text-orange-700', label: '迟交扣分' },
+      };
+      const o = map[p] || { color: 'bg-gray-100 text-gray-600', label: p };
+      return `<span class="text-xs ${o.color} px-2 py-0.5 rounded">${o.label}</span>`;
+    }
+
+    function statusBadge(s) {
+      const map = {
+        'pending':       'bg-yellow-100 text-yellow-700',
+        'submitted':     'bg-green-100 text-green-700',
+        'late':          'bg-orange-100 text-orange-700',
+        'late_allowed':  'bg-amber-100 text-amber-700',
+        'closed':        'bg-red-100 text-red-700',
+        'graded':        'bg-emerald-100 text-emerald-700',
+      };
+      return `<span class="text-xs ${map[s.status_code]||'bg-gray-100 text-gray-600'} px-2 py-0.5 rounded font-medium">${s.status_label}</span>`;
+    }
+
+    function fmt(d) {
+      if (!d) return '';
+      return d.replace('T', ' ').slice(0, 16);
+    }
+
+    async function loadAssignments() {
+      const sn = document.getElementById('student-no').value.trim();
+      const status = document.getElementById('status');
+      status.textContent = '加载中...';
+      try {
+        const r = await fetch(`${API}/api/assignments?student_no=${encodeURIComponent(sn)}`);
+        if (!r.ok) {
+          const e = await r.json();
+          status.innerHTML = `<span class="text-red-600">加载失败：${e.detail}</span>`;
+          document.getElementById('cards').innerHTML = '';
+          return;
+        }
+        const data = await r.json();
+        status.textContent = `学号 ${data.student_no} · 共 ${data.assignments.length} 项作业`;
+        renderCards(data.assignments);
+      } catch (e) {
+        status.innerHTML = `<span class="text-red-600">网络错误：${e.message}</span>`;
+      }
+    }
+
+    function renderCards(list) {
+      const html = list.map(a => {
+        const sub = a.submission;
+        const past = a.is_past_deadline;
+        const left = a.remaining_days;
+        const ddl = fmt(a.deadline);
+
+        const subInfo = sub
+          ? `<div class="bg-gray-50 rounded p-2 text-xs text-gray-600 mt-2">
+              已提交 v${sub.version_no} · ${fmt(sub.submitted_at)} ${sub.is_late ? '<span class="text-orange-600 font-medium">· 迟交</span>' : ''}
+             </div>`
+          : '';
+
+        // 按规则决定按钮
+        let btn = '';
+        if (a.status_code === 'closed') {
+          btn = `<button disabled class="text-xs bg-gray-200 text-gray-500 px-3 py-1.5 rounded-lg cursor-not-allowed">已截止·禁止提交</button>`;
+        } else {
+          const label = sub ? '重新提交' : (past ? '迟交提交' : '提交作业');
+          const cls = past ? 'bg-orange-500 hover:bg-orange-600' : 'bg-blue-600 hover:bg-blue-700';
+          btn = `<button onclick='openModal(${JSON.stringify(a).replace(/'/g, "&#39;")})' class="text-xs ${cls} text-white px-3 py-1.5 rounded-lg">${label}</button>`;
+        }
+
+        return `
+          <div class="bg-white rounded-xl border border-gray-100 p-5 shadow-sm">
+            <div class="flex items-start justify-between gap-2">
+              <div class="flex-1">
+                <h3 class="text-sm font-semibold text-gray-800">${a.title}</h3>
+                <p class="text-xs text-gray-400 mt-0.5">${a.course.name} · ${a.course.term}</p>
+              </div>
+              ${statusBadge({status_code: a.status_code, status_label: a.status_label})}
+            </div>
+            <div class="flex items-center gap-2 mt-3">
+              ${policyBadge(a.late_policy)}
+              <span class="text-xs ${past ? 'text-red-500' : 'text-gray-500'}">
+                截止：${ddl} · ${past ? `已超期 ${-left} 天` : `剩余 ${left} 天`}
+              </span>
+            </div>
+            ${subInfo}
+            <div class="mt-3 flex justify-end">
+              ${btn}
+            </div>
+          </div>
+        `;
+      }).join('');
+      document.getElementById('cards').innerHTML = html || '<p class="text-sm text-gray-400">该学生暂无作业</p>';
+    }
+
+    function openModal(a) {
+      currentAssignment = a;
+      document.getElementById('modal-title').textContent = a.title;
+      const policyText = {
+        'allow':   '本作业策略：截止后<b>允许迟交</b>，将自动标记为"迟交"',
+        'deny':    '本作业策略：截止后<b>禁止提交</b>，请按时完成',
+        'penalty': '本作业策略：截止后<b>允许迟交但扣分</b>',
+      };
+      document.getElementById('modal-policy').innerHTML =
+        `<span class="text-gray-600">${policyText[a.late_policy]||''}</span>`;
+      document.getElementById('text-content').value = '';
+      document.getElementById('submit-result').textContent = '';
+      document.getElementById('modal').classList.remove('hidden');
+    }
+
+    function closeModal() {
+      document.getElementById('modal').classList.add('hidden');
+      currentAssignment = null;
+    }
+
+    async function doSubmit() {
+      if (!currentAssignment) return;
+      const sn = document.getElementById('student-no').value.trim();
+      const text = document.getElementById('text-content').value;
+      const fd = new FormData();
+      fd.append('assignment_id', currentAssignment.id);
+      fd.append('student_no', sn);
+      fd.append('text_content', text);
+      const result = document.getElementById('submit-result');
+      result.textContent = '提交中...';
+      try {
+        const r = await fetch(`${API}/api/assignments/submit`, { method: 'POST', body: fd });
+        const data = await r.json();
+        if (r.ok) {
+          const cls = data.is_late ? 'text-orange-600' : 'text-green-600';
+          result.innerHTML = `<span class="${cls}">✓ ${data.message}（v${data.version_no}）</span>`;
+          setTimeout(() => { closeModal(); loadAssignments(); }, 1200);
+        } else {
+          result.innerHTML = `<span class="text-red-600">✗ ${data.detail}</span>`;
+        }
+      } catch (e) {
+        result.innerHTML = `<span class="text-red-600">网络错误：${e.message}</span>`;
+      }
+    }
+
+    loadAssignments();
+  </script>
+</body>
+</html>

@@ -52,3 +52,7 @@ project.config.json
 project.private.config.json
 *.ps1
 exam-requirements.md
+
+# 作业提交上传文件（运行时数据）
+backend/uploads/
+uploads/

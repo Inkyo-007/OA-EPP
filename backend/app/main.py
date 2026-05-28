@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 import os
 
-from app.database import init_db
+from app.database import init_db, init_mysql_tables
 from app.sync_exams import sync_exams
 from app.sync_chapters import sync_chapters
 from app.routers import (
@@ -24,6 +24,7 @@ from app.routers import (
     chapters,
     timeline,
     profile,
+    assignment,
 )
 # classroom_exam 是 feature 分支新增的路由，若存在则包含
 try:
@@ -52,6 +53,7 @@ app.include_router(notifications.router)
 app.include_router(chapters.router)
 app.include_router(timeline.router)
 app.include_router(profile.router)
+app.include_router(assignment.router)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -127,12 +129,29 @@ def course_detail_page():
 def chapter_page():
     return FileResponse(os.path.join(STATIC_DIR, "chapter.html"))
 
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+@app.get("/assignments")
+def assignments_page():
+    return FileResponse(os.path.join(STATIC_DIR, "assignments.html"))
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.on_event("startup")
 def startup():
-    init_db()
-    sync_chapters()
-    sync_exams()
+    try:
+        init_db()
+    except Exception as e:
+        print(f"[startup] init_db 跳过: {e}")
+    try:
+        sync_chapters()
+    except Exception as e:
+        print(f"[startup] sync_chapters 跳过: {e}")
+    try:
+        sync_exams()
+    except Exception as e:
+        print(f"[startup] sync_exams 跳过: {e}")
+    try:
+        init_mysql_tables()
+    except Exception as e:
+        print(f"[startup] init_mysql_tables 跳过: {e}")
