@@ -188,6 +188,7 @@ def list_exams(authorization: Optional[str] = Header(None)):
     with db() as conn:
         total_students = conn.execute("SELECT COUNT(*) FROM students").fetchone()[0]
         result = []
+        from datetime import datetime
         for e in exams:
             submitted = conn.execute(
                 "SELECT COUNT(*) FROM scores WHERE exam_id=?", (e["id"],)
@@ -195,10 +196,25 @@ def list_exams(authorization: Optional[str] = Header(None)):
             avg = conn.execute(
                 "SELECT AVG(score) FROM scores WHERE exam_id=?", (e["id"],)
             ).fetchone()[0]
+            # 尝试根据 classroom_exams 的时间判断状态（开放中 / 已关闭）
+            ce = conn.execute("SELECT start_at, end_at FROM classroom_exams WHERE id=?", (e["id"],)).fetchone()
+            status = None
+            if ce:
+                try:
+                    now = datetime.now()
+                    start = datetime.strptime(ce["start_at"], "%Y-%m-%d %H:%M:%S")
+                    end = datetime.strptime(ce["end_at"], "%Y-%m-%d %H:%M:%S")
+                    status = "active" if (now >= start and now <= end) else "ended"
+                except Exception:
+                    status = "unknown"
+            else:
+                # 继续使用 is_active 字段作为回退
+                status = "active" if e["is_active"] == 1 else "ended"
             result.append({
                 "id": e["id"], "title": e["title"], "is_active": e["is_active"],
                 "submitted": submitted, "total_students": total_students,
                 "avg_score": round(avg, 1) if avg else None,
+                "status": status,
             })
     return result
 
@@ -221,6 +237,10 @@ def create_exam(req: ExamCreate, authorization: Optional[str] = Header(None)):
 
 class ExamUpdate(BaseModel):
     is_active: int
+
+
+class CleanupRequest(BaseModel):
+    titles: Optional[list[str]] = None
 
 
 @router.put("/api/teacher/exams/{exam_id}")
@@ -329,3 +349,53 @@ def export_scores(exam_id: str = Query(...), authorization: Optional[str] = Head
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"}
     )
+
+
+@router.post("/api/teacher/exams/cleanup")
+def cleanup_exams(req: CleanupRequest, authorization: Optional[str] = Header(None)):
+    """删除指定标题的考试（慎用）。若未提供 titles，则删除已知的三条错误记录。"""
+    _require_teacher(authorization)
+    defaults = [
+        "第 12 章 机器人系统开发环境配置 测验",
+        "第二章 CubeMX 编程测验",
+        "第三章 PicSimlab 仿真开发测验",
+    ]
+    titles = req.titles or defaults
+    affected = 0
+    with db() as conn:
+        for t in titles:
+            # remove from exams
+            cur = conn.execute("DELETE FROM exams WHERE title=?", (t,))
+            affected += cur.rowcount
+            # remove classroom exams and related records
+            rows = conn.execute("SELECT id FROM classroom_exams WHERE title=?", (t,)).fetchall()
+            for r in rows:
+                eid = r["id"]
+                conn.execute("DELETE FROM classroom_exam_questions WHERE exam_id=?", (eid,))
+                conn.execute("DELETE FROM classroom_exam_attempts WHERE exam_id=?", (eid,))
+                conn.execute("DELETE FROM classroom_exams WHERE id=?", (eid,))
+                affected += 1
+    return {"ok": True, "affected": affected}
+
+
+@router.delete("/api/teacher/exams/{exam_id}")
+def delete_exam(exam_id: str, authorization: Optional[str] = Header(None)):
+    """删除某次考试及其相关记录（scores、classroom_exams、questions、attempts）。"""
+    _require_teacher(authorization)
+    affected = 0
+    with db() as conn:
+        # remove scores
+        cur = conn.execute("DELETE FROM scores WHERE exam_id=?", (exam_id,))
+        affected += cur.rowcount
+        # remove exam entry
+        cur2 = conn.execute("DELETE FROM exams WHERE id=?", (exam_id,))
+        affected += cur2.rowcount
+        # remove classroom exam related records if any
+        rows = conn.execute("SELECT id FROM classroom_exams WHERE id=?", (exam_id,)).fetchall()
+        for r in rows:
+            eid = r["id"]
+            conn.execute("DELETE FROM classroom_exam_questions WHERE exam_id=?", (eid,))
+            conn.execute("DELETE FROM classroom_exam_attempts WHERE exam_id=?", (eid,))
+            conn.execute("DELETE FROM classroom_exams WHERE id=?", (eid,))
+            affected += 1
+    return {"ok": True, "deleted": affected}

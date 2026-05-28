@@ -562,7 +562,6 @@ if (__btnAddQ) {
 document.getElementById("btn-create").addEventListener("click", async function () {
   var msgEl = document.getElementById("create-msg");
   try {
-    var questions = ClassroomQuestionEditor.collectAll(document.getElementById("questions"));
     var title = document.getElementById("exam-title").value.trim();
     if (!title) throw new Error("请填写考试标题");
     var startAt = ClassroomQuestionEditor.formatDatetimeForApi(
@@ -572,18 +571,31 @@ document.getElementById("btn-create").addEventListener("click", async function (
       document.getElementById("exam-end").value
     );
     if (!startAt || !endAt) throw new Error("请设置开始与结束时间");
-    var body = {
-      id: document.getElementById("exam-id").value.trim() || undefined,
-      title: title,
-      start_at: startAt,
-      end_at: endAt,
-      questions: questions,
-    };
-    var d = await api("/api/teacher/classroom-exams", {
-      method: "POST", headers: hdr(), body: JSON.stringify(body),
-    });
-    msgEl.textContent = "发布成功：" + d.id;
-    msgEl.style.color = "#2e7d32";
+    // If editing an existing exam, use PUT and only send allowed fields
+    if (window.__editingExam) {
+      var body = { title: title, end_at: endAt };
+      // only include start_at when editing is allowed (input not disabled)
+      if (!document.getElementById('exam-start').disabled) body.start_at = startAt;
+      await api('/api/teacher/classroom-exams/' + window.__editingExam, { method: 'PUT', headers: hdr(), body: JSON.stringify(body) });
+      msgEl.textContent = '已保存修改';
+      msgEl.style.color = '#2e7d32';
+      window.__editingExam = null;
+      document.getElementById('btn-create').textContent = '+ 发布考试';
+    } else {
+      var questions = ClassroomQuestionEditor.collectAll(document.getElementById("questions"));
+      var body = {
+        id: document.getElementById("exam-id").value.trim() || undefined,
+        title: title,
+        start_at: startAt,
+        end_at: endAt,
+        questions: questions,
+      };
+      var d = await api("/api/teacher/classroom-exams", {
+        method: "POST", headers: hdr(), body: JSON.stringify(body),
+      });
+      msgEl.textContent = "发布成功：" + d.id;
+      msgEl.style.color = "#2e7d32";
+    }
     loadExams();
   } catch (e) {
     msgEl.textContent = e.message || String(e);
@@ -599,6 +611,8 @@ async function loadExams(){
       <td>${e.title}</td><td style="font-size:.75rem">${e.start_at}<br>${e.end_at}</td>
       <td>${e.status}</td><td>${e.question_count}</td><td>${e.submitted_count}</td>
       <td><button class="btn btn-o btn-sm" data-id="${e.id}">提交列表</button>
+      <button class="btn btn-o btn-sm" data-edit="${e.id}">编辑</button>
+      <button class="btn btn-o btn-sm" data-sync="${e.id}">同步到系统</button>
       <button class="btn btn-d btn-sm" data-del="${e.id}">删除</button></td>
     </tr>`).join("")}</table>
     <p style="margin-top:8px;font-size:.8rem;color:#888">学生入口：<a href="/classroom-exam">/classroom-exam</a></p>` : "<p>暂无考试</p>";
@@ -609,11 +623,50 @@ async function loadExams(){
     await api("/api/teacher/classroom-exams/"+b.dataset.del, { method:"DELETE", headers:hdr() });
     loadExams();
   });
+  document.querySelectorAll("[data-sync]").forEach(b => b.onclick = async () => {
+    if(!confirm('将此课堂考试同步到系统考试（exams 表）并导入已提交成绩？')) return;
+    try {
+      var d = await api('/api/classroom-exam/' + b.dataset.sync + '/sync', { method: 'POST', headers: hdr() });
+      alert('同步完成：已同步 ' + (d.synced_attempts || 0) + ' 条成绩');
+      loadExams();
+    } catch (e) { alert('同步失败：' + (e.message||e)); }
+  });
+  document.querySelectorAll("[data-edit]").forEach(b => b.onclick = async () => {
+    try {
+      var d = await api('/api/teacher/classroom-exams/' + b.dataset.edit, { headers: hdr() });
+      var ex = d.exam;
+      document.getElementById('exam-id').value = ex.id;
+      document.getElementById('exam-title').value = ex.title;
+      // convert 'YYYY-MM-DD HH:MM:SS' to datetime-local 'YYYY-MM-DDTHH:MM'
+      function toLocal(v){ if (!v) return ''; return v.replace(' ', 'T').slice(0,16); }
+      document.getElementById('exam-start').value = toLocal(ex.start_at);
+      document.getElementById('exam-end').value = toLocal(ex.end_at);
+      // disable start if already started
+      if (d.status && d.status !== 'not_started') {
+        document.getElementById('exam-start').disabled = true;
+      } else {
+        document.getElementById('exam-start').disabled = false;
+      }
+      // fill questions
+      var qcont = document.getElementById('questions'); qcont.innerHTML = '';
+      (d.questions||[]).forEach(function(q){
+        try{ var blk = ClassroomQuestionEditor.createBlock(qcont); }catch(e){}
+      });
+      // set create button into update mode
+      window.__editingExam = ex.id;
+      document.getElementById('btn-create').textContent = '保存修改';
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } catch (e) { alert('加载考试失败：' + (e.message||e)); }
+  });
 }
 
 async function loadAttempts(examId){
+  // Toggle: 若已展开则收起
+  var existing = document.getElementById('attempts-box-' + examId);
+  if (existing) { existing.remove(); return; }
   const d = await api("/api/teacher/classroom-exams/"+examId+"/attempts", { headers:hdr() });
   const box = document.createElement("div");
+  box.id = 'attempts-box-' + examId;
   box.innerHTML = `<h4 style="margin:12px 0">${d.exam_title} — 提交列表</h4><table>
     <tr><th>姓名</th><th>学号</th><th>状态</th><th>客观分</th><th>总分</th><th>操作</th></tr>
     ${d.attempts.filter(a=>a.status!=="draft").map(a=>`<tr>

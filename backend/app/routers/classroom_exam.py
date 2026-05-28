@@ -31,6 +31,36 @@ from app.classroom_exam_service import (
 router = APIRouter()
 
 
+@router.post("/api/classroom-exam/{exam_id}/sync")
+def sync_classroom_exam(exam_id: str, authorization: Optional[str] = Header(None)):
+    """将课堂考试同步到系统考试表，并导入已提交的成绩到 `scores` 表。"""
+    _require_teacher(authorization)
+    with db() as conn:
+        exam = conn.execute("SELECT * FROM classroom_exams WHERE id=?", (exam_id,)).fetchone()
+        if not exam:
+            raise HTTPException(status_code=404, detail="课堂考试不存在")
+        # 插入或更新 exams 表
+        conn.execute("INSERT OR REPLACE INTO exams (id, title, is_active) VALUES (?,?,1)",
+                     (exam["id"], exam["title"]))
+        # 将 classroom_exam_attempts 中已提交或已批改的记录导入 scores 表
+        rows = conn.execute(
+            "SELECT student_id, total_score, objective_score, max_score, submitted_at, status FROM classroom_exam_attempts WHERE exam_id=? AND status IN ('submitted','graded')",
+            (exam_id,)
+        ).fetchall()
+        for r in rows:
+            student_id = r["student_id"]
+            # 若已批改且 total_score 有值，则使用 total_score；否则使用 objective_score（可能为空，取 0）
+            score = r["total_score"] if r["total_score"] is not None else (r["objective_score"] or 0)
+            total = r["max_score"] or 0
+            submitted_at = r["submitted_at"]
+            # 使用 INSERT OR REPLACE 保持 idempotent
+            conn.execute(
+                "INSERT OR REPLACE INTO scores (student_id, exam_id, score, total, submitted_at) VALUES (?,?,?,?,?)",
+                (student_id, exam_id, float(score), float(total), submitted_at),
+            )
+    return {"ok": True, "synced_attempts": len(rows)}
+
+
 def _require_teacher(authorization: Optional[str]):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="请先登录")
@@ -439,14 +469,33 @@ def teacher_update_exam(
 ):
     _require_teacher(authorization)
     with db() as conn:
-        if not get_exam(conn, exam_id):
+        exam = get_exam(conn, exam_id)
+        if not exam:
             raise HTTPException(status_code=404, detail="考试不存在")
-        if req.title is not None:
-            conn.execute("UPDATE classroom_exams SET title=? WHERE id=?", (req.title.strip(), exam_id))
+        # 如果考试已经开始，则不允许修改 start_at
+        from app.classroom_exam_service import parse_dt, exam_status
         if req.start_at is not None:
+            # validate format
+            try:
+                new_start = parse_dt(req.start_at)
+            except Exception:
+                raise HTTPException(status_code=422, detail="开始时间格式无效，请使用 YYYY-MM-DD HH:MM:SS")
+            current_status = exam_status(exam)
+            if current_status != "not_started":
+                raise HTTPException(status_code=400, detail="考试已开始，禁止修改开始时间")
             conn.execute("UPDATE classroom_exams SET start_at=? WHERE id=?", (req.start_at.strip(), exam_id))
         if req.end_at is not None:
+            try:
+                new_end = parse_dt(req.end_at)
+            except Exception:
+                raise HTTPException(status_code=422, detail="结束时间格式无效，请使用 YYYY-MM-DD HH:MM:SS")
+            # ensure end > start (use existing start unless start being updated)
+            start_ref = parse_dt(req.start_at) if req.start_at is not None else parse_dt(exam["start_at"])
+            if new_end <= start_ref:
+                raise HTTPException(status_code=422, detail="结束时间必须晚于开始时间")
             conn.execute("UPDATE classroom_exams SET end_at=? WHERE id=?", (req.end_at.strip(), exam_id))
+        if req.title is not None:
+            conn.execute("UPDATE classroom_exams SET title=? WHERE id=?", (req.title.strip(), exam_id))
         if req.is_active is not None:
             conn.execute("UPDATE classroom_exams SET is_active=? WHERE id=?", (req.is_active, exam_id))
     return {"ok": True}
