@@ -64,6 +64,17 @@ plugins:
       fence_prefix: kroki-
       enable_mermaid: false
 
+# 忽略 figure_table_index.md 中指向未收录章节的链接警告
+validation:
+  links:
+    not_found: ignore
+    anchors: ignore
+
+# 排除未被 nav 收录的页面（减少构建时 INFO 提示）
+exclude_docs: |
+  figure_table_index.md
+  robotics_systems_textbook_report.md
+
 markdown_extensions:
   - toc:
       permalink: true

@@ -8,14 +8,18 @@ manage.py — 课程统一管理入口
   [Q] 退出
 """
 
+# ── 修复 Windows GBK 编码问题（必须在 import 之前通过环境变量设置）──────────
+import io, os, sys
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  标准库导入
 # ══════════════════════════════════════════════════════════════════════════════
-import os
 import signal
 import socket
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -182,10 +186,15 @@ def install_requirements():
         if not req_file.exists():
             print(f"\n❌ 未找到依赖文件: {req_file}")
             sys.exit(1)
-        print(f"⚙️  安装依赖：{req_file.relative_to(REPO_ROOT)}")
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--quiet", "-r", str(req_file)]
-        )
+        print(f"⚙️  安装依赖：{req_file.relative_to(REPO_ROOT)} （可能需要 1-2 分钟，请耐心等待）")
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "-r", str(req_file)],
+                timeout=300,  # 5 分钟超时
+            )
+        except subprocess.TimeoutExpired:
+            print(f"\n❌ 安装 {req_file.name} 超时，请检查网络连接")
+            sys.exit(1)
     print("✅ 依赖安装完成\n")
 
 
@@ -265,11 +274,17 @@ def serve_local():
     else:
         print("⚠️  考试 API 未能在 10 秒内启动，请检查日志")
 
+    # ── 使用虚拟环境中的 mkdocs ──────────────────────────────────────────────
+    venv_bin = Path(sys.executable).parent
+    mkdocs_cmd = str(venv_bin / "mkdocs.exe") if sys.platform == "win32" else str(venv_bin / "mkdocs")
+
     try:
         env = os.environ.copy()
-        env.setdefault("NO_MKDOCS_2_WARNING", "1")
+        # 抑制 MkDocs 2.0 弃用警告
+        env["NO_MKDOCS_2_WARNING"] = "true"
+        # 启动 mkdocs，stderr 只保留 WARNING 以上级别，减少刷屏
         subprocess.run(
-            ["mkdocs", "serve", "-a", f"{HOST}:{MKDOCS_PORT}", "--open", "--watch-theme"],
+            [mkdocs_cmd, "serve", "-a", f"{HOST}:{MKDOCS_PORT}", "--open", "--watch-theme", "-v", "warning"],
             env=env, check=True, cwd=str(REPO_ROOT),
         )
     except KeyboardInterrupt:
