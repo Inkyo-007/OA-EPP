@@ -39,6 +39,17 @@ def _migrate_chapters(conn):
             conn.execute(ddl)
 
 
+def _migrate_courses(conn):
+    """幂等地为旧 courses 表补充总分/截止提醒字段"""
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(courses)").fetchall()}
+    for col, ddl in {
+        "total_score":       "ALTER TABLE courses ADD COLUMN total_score       INTEGER DEFAULT 100",
+        "deadline_reminder": "ALTER TABLE courses ADD COLUMN deadline_reminder TEXT DEFAULT ''",
+    }.items():
+        if col not in existing:
+            conn.execute(ddl)
+
+
 def init_db():
     with db() as conn:
         conn.executescript("""
@@ -69,10 +80,12 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS courses (
-            id         TEXT PRIMARY KEY,
-            title      TEXT NOT NULL,
-            semester   TEXT DEFAULT '',
-            is_active  INTEGER DEFAULT 1
+            id                TEXT PRIMARY KEY,
+            title             TEXT NOT NULL,
+            semester          TEXT DEFAULT '',
+            total_score       INTEGER DEFAULT 100,
+            deadline_reminder TEXT DEFAULT '',
+            is_active         INTEGER DEFAULT 1
         );
 
         CREATE TABLE IF NOT EXISTS chapters (
@@ -89,4 +102,4 @@ def init_db():
         );
         """)
         _migrate_chapters(conn)
-        # 考试记录由 sync_exams() 根据 .md 文件动态维护，此处不再硬编码预置
+        _migrate_courses(conn)

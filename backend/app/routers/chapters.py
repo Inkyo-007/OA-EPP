@@ -13,7 +13,7 @@ def list_courses():
     """获取所有课程列表（含章节统计）"""
     with db() as conn:
         rows = conn.execute(
-            "SELECT id, title, semester, is_active FROM courses ORDER BY semester"
+            "SELECT id, title, semester, total_score, deadline_reminder, is_active FROM courses ORDER BY semester"
         ).fetchall()
         result = []
         for c in rows:
@@ -29,6 +29,8 @@ def list_courses():
                 "id": c["id"],
                 "title": c["title"],
                 "semester": c["semester"],
+                "total_score": c["total_score"],
+                "deadline_reminder": c["deadline_reminder"] or "",
                 "is_active": c["is_active"],
                 "total_chapters": ch_count,
                 "completed_chapters": done_count,
@@ -41,7 +43,7 @@ def list_chapters(course_id: str):
     """获取某课程的所有章节明细"""
     with db() as conn:
         course = conn.execute(
-            "SELECT id, title, semester FROM courses WHERE id=?", (course_id,)
+            "SELECT id, title, semester, total_score, deadline_reminder FROM courses WHERE id=?", (course_id,)
         ).fetchone()
         if not course:
             raise HTTPException(status_code=404, detail="课程不存在")
