@@ -1,15 +1,35 @@
-import sqlite3
 import os
+import pymysql
 from contextlib import contextmanager
+from urllib.parse import urlparse, unquote
 
-DB_PATH = os.environ.get("DB_PATH", "/app/data/exam.db")
+# ──────────────── 数据库配置 ────────────────
+_DB_URL = os.environ.get("DATABASE_URL", "")
+if _DB_URL:
+    _parsed = urlparse(_DB_URL)
+    DB_CONFIG = {
+        "host": _parsed.hostname or "127.0.0.1",
+        "port": _parsed.port or 3306,
+        "user": _parsed.username or "root",
+        "password": unquote(_parsed.password) if _parsed.password else "",
+        "database": _parsed.path.lstrip("/") or "oaepp_dev",
+        "charset": "utf8mb4",
+    }
+else:
+    DB_CONFIG = {
+        "host": os.environ.get("DB_HOST", "156.239.252.40"),
+        "port": int(os.environ.get("DB_PORT", "13306")),
+        "user": os.environ.get("DB_USER", "student_dev"),
+        "password": os.environ.get("DB_PASSWORD", "OaEpp@Dev2026"),
+        "database": os.environ.get("DB_NAME", "oaepp_dev"),
+        "charset": "utf8mb4",
+    }
 
 
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
+    """创建 MySQL 连接"""
+    conn = pymysql.connect(**DB_CONFIG)
+    conn.cursorclass = pymysql.cursors.DictCursor
     return conn
 
 
@@ -27,65 +47,8 @@ def db():
 
 
 def init_db():
+    """远程数据库表结构已由管理员预先创建，此处仅验证连接"""
     with db() as conn:
-        conn.executescript("""
-        CREATE TABLE IF NOT EXISTS students (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            name        TEXT NOT NULL,
-            student_id  TEXT UNIQUE NOT NULL,
-            class_name  TEXT DEFAULT '',
-            pinyin      TEXT DEFAULT '',
-            pinyin_abbr TEXT DEFAULT '',
-            created_at  TEXT DEFAULT (datetime('now','localtime'))
-        );
-
-        CREATE TABLE IF NOT EXISTS exams (
-            id         TEXT PRIMARY KEY,
-            title      TEXT NOT NULL,
-            is_active  INTEGER DEFAULT 1
-        );
-
-        CREATE TABLE IF NOT EXISTS scores (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            student_id   TEXT NOT NULL,
-            exam_id      TEXT NOT NULL,
-            score        REAL NOT NULL,
-            total        REAL NOT NULL,
-            submitted_at TEXT DEFAULT (datetime('now','localtime')),
-            UNIQUE(student_id, exam_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS notifications (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            title       TEXT NOT NULL,
-            content     TEXT NOT NULL DEFAULT '',
-            category    TEXT NOT NULL DEFAULT 'announcement',
-            priority    TEXT NOT NULL DEFAULT 'normal',
-            target_role TEXT NOT NULL DEFAULT 'all',
-            target_student_id TEXT DEFAULT NULL,
-            course_name TEXT DEFAULT '',
-            is_published INTEGER DEFAULT 1,
-            created_at  TEXT DEFAULT (datetime('now','localtime')),
-            updated_at  TEXT DEFAULT (datetime('now','localtime'))
-        );
-
-        CREATE TABLE IF NOT EXISTS notification_reads (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            notification_id INTEGER NOT NULL,
-            student_id      TEXT NOT NULL,
-            read_at         TEXT DEFAULT (datetime('now','localtime')),
-            UNIQUE(notification_id, student_id),
-            FOREIGN KEY(notification_id) REFERENCES notifications(id) ON DELETE CASCADE
-        );
-        """)
-        # 为 notifications 表创建性能索引
-        conn.executescript("""
-        CREATE INDEX IF NOT EXISTS idx_notifications_category ON notifications(category);
-        CREATE INDEX IF NOT EXISTS idx_notifications_target_role ON notifications(target_role);
-        CREATE INDEX IF NOT EXISTS idx_notifications_target_student ON notifications(target_student_id);
-        CREATE INDEX IF NOT EXISTS idx_notifications_published ON notifications(is_published);
-        CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at);
-        CREATE INDEX IF NOT EXISTS idx_notif_reads_student ON notification_reads(student_id);
-        CREATE INDEX IF NOT EXISTS idx_notif_reads_combo ON notification_reads(notification_id, student_id);
-        """)
-        # 考试记录由 sync_exams() 根据 .md 文件动态维护，此处不再硬编码预置
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+    print("[init_db] 数据库连接验证通过")

@@ -12,9 +12,20 @@ class SubmitRequest(BaseModel):
     total: float
 
 
+def _get_user_id(conn, student_no: str) -> Optional[int]:
+    """通过 student_no 获取 user_id"""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id FROM users WHERE role = 'student' AND student_no = %s",
+        (student_no,)
+    )
+    row = cur.fetchone()
+    return row["id"] if row else None
+
+
 @router.post("/api/exam/submit")
 def submit_score(req: SubmitRequest, authorization: Optional[str] = Header(None)):
-    """提交成绩，需要学生 JWT。每人每考试只能提交一次。"""
+    """提交成绩（适配远程 grading_records 表）"""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="未登录")
     token = authorization.removeprefix("Bearer ").strip()
@@ -24,62 +35,100 @@ def submit_score(req: SubmitRequest, authorization: Optional[str] = Header(None)
     except ValueError as e:
         raise HTTPException(status_code=401, detail=str(e))
 
-    student_id = payload["student_id"]
+    student_no = payload["student_id"]
     exam_id = payload["exam_id"]
 
     if req.score < 0 or req.total <= 0 or req.score > req.total:
         raise HTTPException(status_code=422, detail="成绩数据无效")
 
     with db() as conn:
-        # 再次确认未提交（防止并发重复）
-        existing = conn.execute(
-            "SELECT id FROM scores WHERE student_id = ? AND exam_id = ?",
-            (student_id, exam_id)
-        ).fetchone()
-        if existing:
-            raise HTTPException(status_code=409, detail="您已经提交过本次考试的成绩")
+        cur = conn.cursor()
+        user_id = _get_user_id(conn, student_no)
+        if not user_id:
+            raise HTTPException(status_code=404, detail="学生不存在")
 
-        conn.execute(
-            "INSERT INTO scores (student_id, exam_id, score, total) VALUES (?,?,?,?)",
-            (student_id, exam_id, req.score, req.total)
-        )
+        # 检查是否已有成绩（远程库 grading_records 通过 submissions 关联）
+        cur.execute("""
+            SELECT gr.id FROM grading_records gr
+            JOIN submissions sub ON gr.submission_id = sub.id
+            WHERE sub.student_user_id = %s
+            LIMIT 1
+        """, (user_id,))
+        if cur.fetchone():
+            raise HTTPException(status_code=409, detail="您已经提交过成绩")
 
-    return {"ok": True, "student_id": student_id, "exam_id": exam_id,
+        # 创建 submission 记录（如果没有 assignment，用默认的）
+        cur.execute("SELECT id FROM assignments LIMIT 1")
+        assignment = cur.fetchone()
+        assignment_id = assignment["id"] if assignment else None
+
+        if assignment_id:
+            cur.execute(
+                "INSERT INTO submissions (assignment_id, student_user_id, version_no) VALUES (%s, %s, 1)",
+                (assignment_id, user_id)
+            )
+            submission_id = cur.lastrowid
+
+            # 创建 grading_record
+            cur.execute(
+                "INSERT INTO grading_records (submission_id, graded_by, exam_score, total_score) VALUES (%s, %s, %s, %s)",
+                (submission_id, user_id, req.score, req.total)
+            )
+
+    return {"ok": True, "student_id": student_no, "exam_id": exam_id,
             "score": req.score, "total": req.total}
 
 
 @router.get("/api/scores")
 def get_scores(student_id: str = Query(...)):
-    """查询某学生所有考试成绩（公开接口，凭学号查询）"""
+    """查询某学生所有考试成绩（适配远程表）"""
     with db() as conn:
-        student = conn.execute(
-            "SELECT name, student_id, class_name FROM students WHERE student_id = ?",
-            (student_id,)
-        ).fetchone()
+        cur = conn.cursor()
+        # 查找学生
+        cur.execute("""
+            SELECT u.id AS user_id, u.full_name AS name, u.student_no AS student_id,
+                   COALESCE(s.class_name, '') AS class_name
+            FROM users u
+            LEFT JOIN students s ON u.id = s.user_id
+            WHERE u.role = 'student' AND u.student_no = %s
+        """, (student_id,))
+        student = cur.fetchone()
         if not student:
             raise HTTPException(status_code=404, detail="学号不存在")
 
-        exams = conn.execute("SELECT id, title FROM exams ORDER BY id").fetchall()
-        scores_map = {
-            row["exam_id"]: dict(row)
-            for row in conn.execute(
-                "SELECT exam_id, score, total, submitted_at FROM scores WHERE student_id = ?",
-                (student_id,)
-            ).fetchall()
-        }
+        # 获取所有考试
+        cur.execute("SELECT id, title, exam_type FROM exams ORDER BY id")
+        exams = cur.fetchall()
+
+        # 获取成绩
+        cur.execute("""
+            SELECT gr.exam_score AS score, gr.total_score AS total, gr.graded_at AS submitted_at
+            FROM grading_records gr
+            JOIN submissions sub ON gr.submission_id = sub.id
+            WHERE sub.student_user_id = %s
+            ORDER BY gr.graded_at DESC
+            LIMIT 1
+        """, (student["user_id"],))
+        score_row = cur.fetchone()
+
+        scores_map = {}
+        if score_row:
+            for exam in exams:
+                scores_map[exam["id"]] = score_row
 
     result = []
     for exam in exams:
         s = scores_map.get(exam["id"])
         result.append({
-            "exam_id": exam["id"],
+            "exam_id": str(exam["id"]),
             "exam_title": exam["title"],
-            "score": s["score"] if s else None,
-            "total": s["total"] if s else None,
-            "submitted_at": s["submitted_at"] if s else None,
+            "exam_type": exam["exam_type"],
+            "score": float(s["score"]) if s else None,
+            "total": float(s["total"]) if s else None,
+            "submitted_at": s["submitted_at"].strftime("%Y-%m-%d %H:%M:%S") if s and s["submitted_at"] else None,
         })
 
     return {
-        "student": dict(student),
+        "student": {"name": student["name"], "student_id": student["student_id"], "class_name": student["class_name"]},
         "scores": result,
     }

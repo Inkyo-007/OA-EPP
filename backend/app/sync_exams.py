@@ -17,9 +17,8 @@ from pathlib import Path
 from app.database import db
 
 DOCS_DIR = os.environ.get("DOCS_DIR", "")
+COURSE_ID = int(os.environ.get("COURSE_ID", "2"))
 
-# 内置备用文档目录：镜像构建时打包的 docs 副本（/app/docs_baked/）
-# 当 DOCS_DIR 挂载失败或为空目录时，自动回退到此目录
 _BAKED_DOCS_DIR = Path(__file__).parent.parent / "docs_baked"
 
 _QUIZ_RE       = re.compile(r"<quiz\b",                              re.IGNORECASE)
@@ -71,8 +70,6 @@ def _inject_exam_meta(content: str, exam_id: str, exam_title: str) -> str:
 
 
 def _find_docs_dir() -> "Path | None":
-    """按优先级查找有效的文档目录（含 .md 文件）。"""
-    # 优先使用环境变量指定的目录（支持 bind mount 写回）
     if DOCS_DIR:
         candidate = Path(DOCS_DIR)
         if candidate.is_dir() and any(candidate.rglob("*.md")):
@@ -80,7 +77,6 @@ def _find_docs_dir() -> "Path | None":
         if candidate.is_dir():
             print(f"[sync_exams] DOCS_DIR={DOCS_DIR!r} 目录为空或无 .md 文件，尝试内置备用目录")
 
-    # 回退到镜像内置的备用文档目录（/app/docs_baked/）
     if _BAKED_DOCS_DIR.is_dir() and any(_BAKED_DOCS_DIR.rglob("*.md")):
         print(f"[sync_exams] 使用内置备用文档目录: {_BAKED_DOCS_DIR}")
         return _BAKED_DOCS_DIR
@@ -89,7 +85,7 @@ def _find_docs_dir() -> "Path | None":
 
 
 def sync_exams() -> dict:
-    """扫描文档目录，自动修复 .md 文件并同步数据库。返回操作摘要字典。"""
+    """扫描文档目录，自动修复 .md 文件并同步数据库。"""
     docs_dir = _find_docs_dir()
     if docs_dir is None:
         print(f"[sync_exams] 未找到有效文档目录（DOCS_DIR={DOCS_DIR!r}），跳过扫描")
@@ -117,23 +113,29 @@ def sync_exams() -> dict:
     updated = []
     deleted = []
     with db() as conn:
-        existing = {r["id"]: r["title"] for r in conn.execute("SELECT id, title FROM exams")}
+        cur = conn.cursor()
+        cur.execute("SELECT id, title FROM exams WHERE course_id = %s", (COURSE_ID,))
+        existing = {str(r["id"]): r["title"] for r in cur.fetchall()}
+
         for eid, etitle in found.items():
             if eid not in existing:
-                conn.execute("INSERT INTO exams (id, title, is_active) VALUES (?,?,1)", (eid, etitle))
+                cur.execute(
+                    "INSERT INTO exams (course_id, title, exam_type, start_at, end_at, created_by) "
+                    "VALUES (%s, %s, 'quiz', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY), 14)",
+                    (COURSE_ID, etitle)
+                )
                 added.append(eid)
                 print(f"[sync_exams] 数据库新增考试：{eid} - {etitle}")
             else:
-                # 如果文档中 exam-title 与数据库中不一致，更新数据库中的标题
                 if existing.get(eid) != etitle:
-                    conn.execute("UPDATE exams SET title=? WHERE id=?", (etitle, eid))
+                    cur.execute("UPDATE exams SET title = %s WHERE id = %s", (etitle, eid))
                     updated.append(eid)
                     print(f"[sync_exams] 数据库更新考试标题：{eid} - {etitle}")
-        # 只有在确实扫描到考试文档时才清理孤立记录，防止挂载目录为空时误删所有考试
+
         if found:
             for eid in list(existing):
                 if eid not in found:
-                    conn.execute("DELETE FROM exams WHERE id=?", (eid,))
+                    cur.execute("DELETE FROM exams WHERE id = %s", (eid,))
                     deleted.append(eid)
                     print(f"[sync_exams] 数据库删除孤立考试：{eid}")
         elif existing:
