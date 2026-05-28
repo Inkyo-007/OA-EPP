@@ -435,17 +435,21 @@ def public_list_notifications(
         )
         total = cur.fetchone()["cnt"]
 
-        # 按 title+category 分组查询，取每组最新的一条代表
+        # 按 title+category 分组查询，取每组最新的一条代表（兼容 only_full_group_by）
         cur.execute(
-            "SELECT g.id, g.body, g.title, g.category, g.created_at, "
-            "SUM(CASE WHEN g.is_read=1 THEN 1 ELSE 0 END) > 0 AS any_read "
+            "SELECT id, body, title, category, created_at, "
+            "(CASE WHEN is_read = 1 THEN 1 ELSE 0 END) > 0 AS any_read "
             "FROM ("
-            "SELECT MIN(n.id) AS id, ANY_VALUE(n.body) AS body, n.title, n.category, "
-            "MAX(n.created_at) AS created_at, MAX(n.is_read) AS is_read "
-            "FROM notifications n WHERE n.user_id = %s "
-            "GROUP BY n.title, n.category "
-            "ORDER BY created_at DESC LIMIT %s OFFSET %s) AS g",
-            (user_id, page_size, (page - 1) * page_size)
+            "  SELECT n.id, n.body, n.title, n.category, "
+            "         n.created_at, n.is_read, "
+            "         ROW_NUMBER() OVER ("
+            "             PARTITION BY n.title, n.category "
+            "             ORDER BY n.created_at DESC"
+            "         ) AS rn "
+            "  FROM notifications n WHERE n.user_id = %s"
+            ") ranked "
+            "WHERE rn <= %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
+            (user_id, 50, page_size, (page - 1) * page_size)
         )
         rows = cur.fetchall()
 
