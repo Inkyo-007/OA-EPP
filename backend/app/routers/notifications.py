@@ -3,6 +3,7 @@ from typing import Optional
 from pydantic import BaseModel
 from app.database import db
 from app.auth_utils import require_teacher, get_student_from_token
+from datetime import datetime
 
 router = APIRouter()
 
@@ -12,7 +13,7 @@ VALID_CATEGORIES = ("announcement", "deadline", "grade", "system", "graded")
 # ──────────────── 辅助 ────────────────
 
 def _get_unread_count(conn, user_id: int) -> int:
-    """统计学生未读通知数（远程 notifications 表）"""
+    """统计学生未读通知数"""
     cur = conn.cursor()
     cur.execute(
         "SELECT COUNT(*) AS cnt FROM notifications WHERE user_id = %s AND is_read = 0",
@@ -34,6 +35,8 @@ class NotificationCreate(BaseModel):
     title: str
     content: str = ""
     category: str = "announcement"
+    course_id: Optional[int] = None
+    target_user_ids: Optional[list] = None  # 指定发给哪些学生
 
 
 class NotificationUpdate(BaseModel):
@@ -46,7 +49,7 @@ class NotificationUpdate(BaseModel):
 
 @router.post("/api/teacher/notifications")
 def create_notification(req: NotificationCreate, authorization: Optional[str] = Header(None)):
-    """创建通知（广播：给所有选课学生每人发一条）"""
+    """创建通知（广播：可指定课程范围或指定学生）"""
     require_teacher(authorization)
     if req.category not in VALID_CATEGORIES:
         raise HTTPException(status_code=422,
@@ -54,23 +57,35 @@ def create_notification(req: NotificationCreate, authorization: Optional[str] = 
 
     with db() as conn:
         cur = conn.cursor()
-        # 获取所有选课学生
-        cur.execute("""
-            SELECT e.student_user_id FROM enrollments e
-            JOIN courses c ON e.course_id = c.id
-            WHERE c.status = 'open'
-        """)
-        students = cur.fetchall()
 
-        if not students:
-            raise HTTPException(status_code=422, detail="没有选课学生，无法发送通知")
+        # 确定目标学生列表
+        if req.target_user_ids:
+            student_ids = req.target_user_ids
+        elif req.course_id:
+            cur.execute(
+                "SELECT e.student_user_id FROM enrollments e WHERE e.course_id = %s",
+                (req.course_id,)
+            )
+            students = cur.fetchall()
+            student_ids = [s["student_user_id"] for s in students]
+        else:
+            cur.execute("""
+                SELECT e.student_user_id FROM enrollments e
+                JOIN courses c ON e.course_id = c.id
+                WHERE c.status = 'open'
+            """)
+            students = cur.fetchall()
+            student_ids = [s["student_user_id"] for s in students]
+
+        if not student_ids:
+            raise HTTPException(status_code=422, detail="没有目标学生，无法发送通知")
 
         # 批量插入通知
         notification_ids = []
-        for s in students:
+        for uid in student_ids:
             cur.execute(
                 "INSERT INTO notifications (user_id, title, body, category) VALUES (%s, %s, %s, %s)",
-                (s["student_user_id"], req.title, req.content, req.category)
+                (uid, req.title, req.content, req.category)
             )
             notification_ids.append(cur.lastrowid)
 
@@ -155,16 +170,12 @@ def teacher_list_notifications(
         )
         rows = cur.fetchall()
 
-        # 统计已读/未读
-        cur.execute("SELECT COUNT(*) AS cnt FROM notifications")
-        total_count = cur.fetchone()["cnt"]
-
     result = []
     for r in rows:
         d = dict(r)
         _datetime_to_str(d, "created_at")
         d["read_count"] = 1 if d.get("is_read") else 0
-        d["total_students"] = 1  # 一对一通知
+        d["total_students"] = 1
         result.append(d)
 
     return {"items": result, "total": total, "page": page, "page_size": page_size}
@@ -213,24 +224,71 @@ def student_list_notifications(
         cur.execute(f"SELECT COUNT(*) AS cnt FROM notifications n{where}", params)
         total = cur.fetchone()["cnt"]
 
+        # 查询通知，关联 courses 获取课程名称
         cur.execute(
-            f"SELECT * FROM notifications n{where} ORDER BY n.created_at DESC LIMIT %s OFFSET %s",
+            f"SELECT n.*, c.name AS course_name "
+            f"FROM notifications n "
+            f"LEFT JOIN enrollments e ON n.user_id = e.student_user_id "
+            f"LEFT JOIN courses c ON e.course_id = c.id "
+            f"{where} "
+            f"ORDER BY n.created_at DESC LIMIT %s OFFSET %s",
             (*params, page_size, (page - 1) * page_size)
         )
         rows = cur.fetchall()
 
         unread_count = _get_unread_count(conn, user_id)
 
+        # 按分类统计
+        cur.execute(
+            "SELECT category, COUNT(*) AS cnt FROM notifications "
+            "WHERE user_id = %s GROUP BY category",
+            (user_id,)
+        )
+        category_counts = {r["category"]: r["cnt"] for r in cur.fetchall()}
+        for cat in ("announcement", "deadline", "grade"):
+            if cat not in category_counts:
+                category_counts[cat] = 0
+
+    now = datetime.now()
     items = []
     for r in rows:
         d = dict(r)
-        # 映射 body → content
         d["content"] = d.pop("body", "")
         d["is_read"] = bool(d.get("is_read", 0))
         _datetime_to_str(d, "created_at")
+        d["course_name"] = d.get("course_name") or ""
+
+        # 优先级推断
+        cat = d.get("category", "")
+        if cat == "deadline":
+            created = d.get("created_at")
+            if created and not d["is_read"]:
+                try:
+                    ct = datetime.strptime(created, "%Y-%m-%d %H:%M:%S")
+                    if (now - ct).days <= 3:
+                        d["priority"] = "urgent"
+                    else:
+                        d["priority"] = "important"
+                except Exception:
+                    d["priority"] = "important"
+            else:
+                d["priority"] = "important"
+        elif cat == "grade":
+            d["priority"] = "important"
+        elif cat == "announcement" and not d["is_read"]:
+            d["priority"] = "normal"
+        else:
+            d["priority"] = "normal"
         items.append(d)
 
-    return {"items": items, "total": total, "page": page, "page_size": page_size, "unread_count": unread_count}
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "unread_count": unread_count,
+        "category_counts": category_counts
+    }
 
 
 @router.post("/api/notifications/{nid}/read")
@@ -279,12 +337,50 @@ def mark_all_read(authorization: Optional[str] = Header(None)):
 def get_unread_count(authorization: Optional[str] = Header(None)):
     student = get_student_from_token(authorization)
     if not student:
-        return {"unread_count": 0}
+        return {"unread_count": 0, "category_counts": {}}
 
     with db() as conn:
         user_id = _get_user_id_by_student_no(conn, student["student_id"])
         if not user_id:
-            return {"unread_count": 0}
+            return {"unread_count": 0, "category_counts": {}}
         unread_count = _get_unread_count(conn, user_id)
 
-    return {"unread_count": unread_count}
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT category, COUNT(*) AS cnt FROM notifications "
+            "WHERE user_id = %s GROUP BY category",
+            (user_id,)
+        )
+        category_counts = {r["category"]: r["cnt"] for r in cur.fetchall()}
+        for cat in ("announcement", "deadline", "grade"):
+            if cat not in category_counts:
+                category_counts[cat] = 0
+
+    return {"unread_count": unread_count, "category_counts": category_counts}
+
+
+@router.get("/api/notifications/category-stats")
+def get_category_stats(authorization: Optional[str] = Header(None)):
+    """获取各分类通知数量（供标签页显示）"""
+    student = get_student_from_token(authorization)
+    if not student:
+        return {"category_counts": {}}
+
+    with db() as conn:
+        user_id = _get_user_id_by_student_no(conn, student["student_id"])
+        if not user_id:
+            return {"category_counts": {}}
+
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT category, COUNT(*) AS cnt FROM notifications "
+            "WHERE user_id = %s GROUP BY category",
+            (user_id,)
+        )
+        category_counts = {r["category"]: r["cnt"] for r in cur.fetchall()}
+        result = {}
+        for cat in ("announcement", "deadline", "grade"):
+            result[cat] = category_counts.get(cat, 0)
+        result["all"] = sum(result.values())
+
+    return {"category_counts": result}

@@ -385,8 +385,29 @@ function updateBadge() {
 }
 
 function updateCategoryCounts(data) {
-  // 简单更新：仅用当前数据设置计数（完整计数需额外 API）
+  // 使用后端返回的 category_counts
+  const cc = data.category_counts || {};
   document.getElementById('count-all').textContent = data.total || 0;
+  document.getElementById('count-announcement').textContent = cc.announcement || 0;
+  document.getElementById('count-deadline').textContent = cc.deadline || 0;
+  document.getElementById('count-grade').textContent = cc.grade || 0;
+  document.getElementById('count-unread').textContent = data.unread_count || 0;
+}
+
+async function refreshCategoryCounts() {
+  const token = getToken();
+  if (!token) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/notifications/category-stats`, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    const data = await res.json();
+    const cc = data.category_counts || {};
+    document.getElementById('count-all').textContent = cc.all || 0;
+    document.getElementById('count-announcement').textContent = cc.announcement || 0;
+    document.getElementById('count-deadline').textContent = cc.deadline || 0;
+    document.getElementById('count-grade').textContent = cc.grade || 0;
+  } catch {}
 }
 
 // ──────────────────── Tab Switch ────────────────────
@@ -458,11 +479,12 @@ function formatTime(dt) {
 
 // ──────────────────── Init ────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
-  // 先获取未读数
+  // 先获取未读数和分类计数
   const token = getToken();
   if (token) {
     globalUnreadCount = await fetchUnreadCount();
     updateBadge();
+    await refreshCategoryCounts();
   }
   loadNotifications();
 });

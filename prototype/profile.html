@@ -158,5 +158,29 @@
       </div>
     </div>
   </main>
+
+<script>
+// ─── 侧边栏未读通知角标 ───
+(async function updateSidebarBadge() {
+  try {
+    const token = new URLSearchParams(window.location.search).get('token') || localStorage.getItem('student_token') || '';
+    if (!token) return;
+    const res = await fetch('http://127.0.0.1:8009/api/notifications/unread-count', {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    const data = await res.json();
+    const badge = document.getElementById('sidebar-badge');
+    if (!badge) return;
+    const count = data.unread_count || 0;
+    if (count > 0) {
+      badge.textContent = count > 99 ? '99+' : count;
+      badge.classList.remove('hidden');
+    } else {
+      badge.classList.add('hidden');
+    }
+  } catch {}
+})();
+</script>
+
 </body>
 </html>
