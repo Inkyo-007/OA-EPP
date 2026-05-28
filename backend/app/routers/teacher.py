@@ -329,3 +329,81 @@ def export_scores(exam_id: str = Query(...), authorization: Optional[str] = Head
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"}
     )
+
+
+# ───── GitHub 账号绑定状态看板 (F-T-004) ─────
+
+
+@router.get("/api/teacher/github-bindings/summary")
+def get_binding_summary(authorization: Optional[str] = Header(None)):
+    """获取全班绑定状态汇总统计"""
+    _require_teacher(authorization)
+    with db() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM students").fetchone()[0]
+        bound = conn.execute(
+            "SELECT COUNT(*) FROM github_bindings WHERE status='bound'"
+        ).fetchone()[0]
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM github_bindings WHERE status='pending'"
+        ).fetchone()[0]
+        unbound = total - bound - pending
+    return {"total": total, "bound": bound, "pending": pending, "unbound": max(unbound, 0)}
+
+
+@router.get("/api/teacher/github-bindings/list")
+def get_binding_list(
+    status: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    sort_by_status: bool = Query(False),
+    authorization: Optional[str] = Header(None)
+):
+    """获取全班学生 GitHub 绑定状态列表，支持筛选、搜索、排序"""
+    _require_teacher(authorization)
+
+    with db() as conn:
+        query = """
+            SELECT s.name, s.student_id, s.class_name,
+                   COALESCE(g.github_username, '') AS github_username,
+                   COALESCE(g.status, 'unbound') AS binding_status,
+                   COALESCE(g.github_name, '') AS github_name,
+                   g.verified_at, g.updated_at
+            FROM students s
+            LEFT JOIN github_bindings g ON s.student_id = g.student_id
+        """
+        conditions = []
+        params: list = []
+
+        if status and status != "all":
+            if status == "unbound":
+                conditions.append("(g.status IS NULL OR g.status='unbound')")
+            else:
+                conditions.append("g.status = ?")
+                params.append(status)
+
+        if search:
+            conditions.append(
+                "(s.name LIKE ? OR s.student_id LIKE ? OR g.github_username LIKE ?)"
+            )
+            like = f"%{search}%"
+            params.extend([like, like, like])
+
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+
+        if sort_by_status:
+            query += """
+                ORDER BY
+                    CASE
+                        WHEN g.status IS NULL OR g.status='unbound' THEN 0
+                        WHEN g.status='pending' THEN 1
+                        WHEN g.status='bound' THEN 2
+                    END,
+                    s.student_id
+            """
+        else:
+            query += " ORDER BY s.student_id"
+
+    with db() as conn:
+        rows = conn.execute(query, params).fetchall()
+
+    return [dict(r) for r in rows]

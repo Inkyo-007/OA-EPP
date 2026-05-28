@@ -54,5 +54,16 @@ def init_db():
             submitted_at TEXT DEFAULT (datetime('now','localtime')),
             UNIQUE(student_id, exam_id)
         );
+
+        CREATE TABLE IF NOT EXISTS github_bindings (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id      TEXT UNIQUE NOT NULL,
+            github_username TEXT DEFAULT '',
+            status          TEXT DEFAULT 'unbound',
+            github_name     TEXT DEFAULT '',
+            verified_at     TEXT DEFAULT NULL,
+            created_at      TEXT DEFAULT (datetime('now','localtime')),
+            updated_at      TEXT DEFAULT (datetime('now','localtime'))
+        );
         """)
         # 考试记录由 sync_exams() 根据 .md 文件动态维护，此处不再硬编码预置
