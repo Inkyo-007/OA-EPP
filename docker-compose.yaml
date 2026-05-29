@@ -81,8 +81,13 @@ services:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-change-me}
     expose:
       - "80"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
     labels:
-      coolify.domain: "phpmyadmin.oaepp.uwis.cn"
       caddy: "phpmyadmin.oaepp.uwis.cn"
       caddy.reverse_proxy: "{{upstreams 80}}"
     depends_on:
