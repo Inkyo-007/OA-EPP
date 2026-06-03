@@ -19,6 +19,7 @@ from app.routers import (
     auth,
     exam,
     teacher,
+    report,
     notifications,
     chapters,
     timeline,
@@ -43,6 +44,7 @@ app.include_router(students.router)
 app.include_router(auth.router)
 app.include_router(exam.router)
 app.include_router(teacher.router)
+app.include_router(report.router)
 if _HAS_CLASSROOM_EXAM:
     app.include_router(classroom_exam.router)
 app.include_router(notifications.router)
