@@ -55,8 +55,21 @@ def create_notification(req: NotificationCreate, authorization: Optional[str] = 
         raise HTTPException(status_code=422,
                             detail=f"无效分类，可选值：{', '.join(VALID_CATEGORIES)}")
 
+    # 防重复提交：检查最近 30 秒内是否已存在相同 title + category 的通知
     with db() as conn:
         cur = conn.cursor()
+
+        cur.execute(
+            "SELECT COUNT(*) AS cnt FROM notifications "
+            "WHERE title = %s AND category = %s "
+            "AND created_at >= NOW() - INTERVAL 30 SECOND",
+            (req.title, req.category)
+        )
+        if cur.fetchone()["cnt"] > 0:
+            raise HTTPException(
+                status_code=409,
+                detail="相同标题和分类的通知在 30 秒内已发送过，请勿重复提交"
+            )
 
         # 确定目标学生列表
         if req.target_user_ids:

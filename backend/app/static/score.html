@@ -240,6 +240,7 @@ let notifCurrentCat = 'all';
 let notifAllItems = [];
 let notifCurrentStudentId = null;
 let notifPollInterval = null;
+let isMarkingAllRead = false;
 
 async function loadNotifications(studentId, isSilent = false) {
   const module = document.getElementById('notif-module');
@@ -262,24 +263,25 @@ async function loadNotifications(studentId, isSilent = false) {
     // 更新未读角标
     const unread = d.unread_count || 0;
     if (unread > 0) {
-      badge.textContent = unread;
+      badge.textContent = unread > 99 ? '99+' : unread;
       badgeWrap.style.display = '';
     } else {
       badgeWrap.style.display = 'none';
     }
 
-    // 静默轮询：只在有新通知时才刷新列表
+    // 静默轮询：只在有新通知或未读数变化时才刷新列表
     if (isSilent) {
       const oldIds = new Set(notifAllItems.map(i => i.id));
       const hasNew = newItems.some(i => !oldIds.has(i.id));
-      if (!hasNew) return;
+      const oldUnreadCount = notifAllItems.filter(i => !i.is_read).length;
+      if (!hasNew && unread === oldUnreadCount) return;
     }
 
     notifAllItems = newItems;
     renderNotifList();
   } catch(e) {
     if (!isSilent) {
-      listEl.innerHTML = '<p style="color:#c62828;text-align:center;padding:16px">加载失败</p>';
+      listEl.innerHTML = '<p style="color:#c62828;text-align:center;padding:16px">加载失败，请稍后重试</p>';
     }
   }
 }
@@ -307,7 +309,8 @@ function renderNotifList() {
     : notifAllItems.filter(n => n.category === notifCurrentCat);
 
   if (!items.length) {
-    listEl.innerHTML = '<p style="color:#bbb;text-align:center;padding:20px;font-size:.9rem">暂无通知</p>';
+    const msg = notifCurrentCat === 'all' ? '暂无通知' : `暂无${N_CAT_LABELS[notifCurrentCat] || notifCurrentCat}类通知`;
+    listEl.innerHTML = `<p style="color:#bbb;text-align:center;padding:20px;font-size:.9rem">${msg}</p>`;
     return;
   }
 
@@ -328,7 +331,7 @@ function renderNotifList() {
           <span style="font-size:.78rem;color:#999;">${n.is_read ? '✅ 已读' : '📩 未读'}</span>
           ${n.is_read
             ? '<button class="btn-read done" disabled>已标记为已读</button>'
-            : `<button class="btn-read" onclick="event.stopPropagation();markRead(${n.id}, '${escHtml2(notifCurrentStudentId)}')">标记已读</button>`
+            : `<button class="btn-read" id="read-btn-${n.id}" onclick="event.stopPropagation();markRead(${n.id}, '${escHtml2(notifCurrentStudentId)}')">标记已读</button>`
           }
         </div>
       </div>
@@ -355,24 +358,61 @@ function toggleNotifDetail(nid) {
   card.classList.toggle('expanded');
 }
 
+let markingReadIds = new Set();
+
 async function markRead(nid, studentId) {
+  // 防重复标记
+  if (markingReadIds.has(nid)) return;
+  markingReadIds.add(nid);
+
+  // 按钮 loading 状态
+  const btn = document.getElementById('read-btn-' + nid);
+  if (btn) {
+    btn.textContent = '标记中…';
+    btn.disabled = true;
+  }
+
   try {
     await fetch(`${API}/api/public/notifications/${nid}/read?student_id=${encodeURIComponent(studentId)}`, {
       method: 'POST'
     });
     loadNotifications(studentId);
-  } catch(e) { /* 静默处理 */ }
+  } catch(e) { /* 静默处理 */ } finally {
+    markingReadIds.delete(nid);
+  }
 }
 
 async function markAllNotificationsRead() {
-  if (!notifCurrentStudentId) return;
+  if (!notifCurrentStudentId || isMarkingAllRead) return;
+
+  const unreadItems = notifAllItems.filter(n => !n.is_read);
+  if (unreadItems.length === 0) return;
+
+  isMarkingAllRead = true;
+  const allReadBtn = document.querySelector('#notif-module .btn');
+  const originalText = allReadBtn ? allReadBtn.textContent : '';
+  if (allReadBtn) {
+    allReadBtn.textContent = '标记中…';
+    allReadBtn.disabled = true;
+    allReadBtn.style.opacity = '0.6';
+  }
+
   try {
-    const unreadItems = notifAllItems.filter(n => !n.is_read);
-    for (const n of unreadItems) {
-      await fetch(`${API}/api/public/notifications/${n.id}/read?student_id=${encodeURIComponent(notifCurrentStudentId)}`, { method: 'POST' });
-    }
+    // 批量并发标记，而非串行
+    await Promise.all(
+      unreadItems.map(n =>
+        fetch(`${API}/api/public/notifications/${n.id}/read?student_id=${encodeURIComponent(notifCurrentStudentId)}`, { method: 'POST' })
+      )
+    );
     loadNotifications(notifCurrentStudentId);
-  } catch(e) { /* 静默处理 */ }
+  } catch(e) { /* 静默处理 */ } finally {
+    isMarkingAllRead = false;
+    if (allReadBtn) {
+      allReadBtn.textContent = originalText;
+      allReadBtn.disabled = false;
+      allReadBtn.style.opacity = '1';
+    }
+  }
 }
 
 function escHtml2(s) {

@@ -200,12 +200,12 @@
         <div id="notif-msg"></div>
 
         <!-- 发送通知表单 -->
-        <div style="margin-bottom:20px;padding:16px;background:#f8f9fa;border-radius:8px;">
+        <div id="notif-form" style="margin-bottom:20px;padding:16px;background:#f8f9fa;border-radius:8px;">
           <p style="font-size:.9rem;font-weight:bold;margin-bottom:12px;color:#555">✉️ 发送新通知</p>
           <div class="notif-form-row">
             <div class="field" style="flex:2;min-width:200px;">
               <label class="form-label">标题 *</label>
-              <input type="text" id="notif-title" placeholder="如：期末考试成绩已公布">
+              <input type="text" id="notif-title" placeholder="如：期末考试成绩已公布" maxlength="200" onkeydown="if(event.key==='Enter' && event.ctrlKey)sendNotification()">
             </div>
             <div class="field" style="min-width:140px;">
               <label class="form-label">分类</label>
@@ -219,9 +219,9 @@
           </div>
           <div class="field" style="margin-top:8px;">
             <label class="form-label">通知内容 *</label>
-            <textarea id="notif-content" rows="3" placeholder="输入通知正文…"></textarea>
+            <textarea id="notif-content" rows="3" placeholder="输入通知正文…（Ctrl+Enter 快速发送）"></textarea>
           </div>
-          <p style="font-size:.78rem;color:#888;margin-top:6px">通知将发送给所有已注册的学生</p>
+          <p style="font-size:.78rem;color:#888;margin-top:6px">通知将发送给所有已注册的学生 · Ctrl+Enter 快速发送</p>
         </div>
 
         <!-- 已发通知列表 -->
@@ -540,12 +540,30 @@ const CATEGORY_LABELS = {
   system: '系统', graded: '已批改'
 };
 
+let isSendingNotification = false;
+
 async function sendNotification() {
+  // 防重复点击
+  if (isSendingNotification) return;
+
   const title = document.getElementById('notif-title').value.trim();
   const content = document.getElementById('notif-content').value.trim();
   const category = document.getElementById('notif-category').value;
   if (!title) { showMsg('notif-msg', '请输入通知标题', 'error'); return; }
   if (!content) { showMsg('notif-msg', '请输入通知内容', 'error'); return; }
+
+  // 字符长度校验
+  if (title.length > 200) { showMsg('notif-msg', '标题不能超过 200 个字符', 'error'); return; }
+  if (content.length > 5000) { showMsg('notif-msg', '内容不能超过 5000 个字符', 'error'); return; }
+
+  // 设置 loading 状态
+  isSendingNotification = true;
+  const sendBtn = document.querySelector('#notif-form button.btn-primary');
+  const originalText = sendBtn.textContent;
+  sendBtn.textContent = '发送中…';
+  sendBtn.disabled = true;
+  sendBtn.style.opacity = '0.6';
+  sendBtn.style.cursor = 'not-allowed';
 
   try {
     const r = await fetch(`${API}/api/teacher/notifications`, {
@@ -554,12 +572,28 @@ async function sendNotification() {
       body: JSON.stringify({ title, content, category })
     });
     const d = await r.json();
-    if (!r.ok) { showMsg('notif-msg', d.detail || '发送失败', 'error'); return; }
+    if (!r.ok) {
+      if (r.status === 409) {
+        showMsg('notif-msg', d.detail || '请勿重复提交相同通知', 'error');
+      } else {
+        showMsg('notif-msg', d.detail || '发送失败', 'error');
+      }
+      return;
+    }
     showMsg('notif-msg', `✅ 通知已发送，覆盖 ${d.sent_count} 名学生`);
     document.getElementById('notif-title').value = '';
     document.getElementById('notif-content').value = '';
     loadNotificationList();
-  } catch(e) { showMsg('notif-msg', '网络错误：' + e, 'error'); }
+  } catch(e) {
+    showMsg('notif-msg', '网络错误：' + e, 'error');
+  } finally {
+    // 恢复按钮状态
+    isSendingNotification = false;
+    sendBtn.textContent = originalText;
+    sendBtn.disabled = false;
+    sendBtn.style.opacity = '1';
+    sendBtn.style.cursor = 'pointer';
+  }
 }
 
 let tnotifCurrentCat = 'all';
@@ -684,13 +718,23 @@ function editAndResend(nid, title, body, category) {
   `;
   document.body.appendChild(backdrop);
 
+  let isResending = false;
+
   backdrop.querySelector('#edit-cancel').onclick = () => backdrop.remove();
   backdrop.querySelector('#edit-confirm').onclick = async () => {
+    if (isResending) return;
     const newTitle = backdrop.querySelector('#edit-title').value.trim();
     const newContent = backdrop.querySelector('#edit-content').value.trim();
     const newCategory = backdrop.querySelector('#edit-category').value;
     if (!newTitle) { alert('请输入标题'); return; }
     if (!newContent) { alert('请输入内容'); return; }
+    if (newTitle.length > 200) { alert('标题不能超过 200 个字符'); return; }
+
+    isResending = true;
+    const confirmBtn = backdrop.querySelector('#edit-confirm');
+    confirmBtn.textContent = '处理中…';
+    confirmBtn.disabled = true;
+    confirmBtn.style.opacity = '0.6';
 
     try {
       // 先删除旧通知（按 title+category 批量删除）
@@ -705,11 +749,22 @@ function editAndResend(nid, title, body, category) {
         body: JSON.stringify({ title: newTitle, content: newContent, category: newCategory })
       });
       const d = await r.json();
-      if (!r.ok) { showMsg('notif-msg', d.detail || '发送失败', 'error'); return; }
+      if (!r.ok) {
+        if (r.status === 409) {
+          showMsg('notif-msg', d.detail || '请勿重复提交', 'error');
+        } else {
+          showMsg('notif-msg', d.detail || '发送失败', 'error');
+        }
+        return;
+      }
       showMsg('notif-msg', `✅ 通知已修改并重发，覆盖 ${d.sent_count} 名学生`);
       backdrop.remove();
       loadNotificationList();
-    } catch(e) { showMsg('notif-msg', '网络错误：' + e, 'error'); }
+    } catch(e) {
+      showMsg('notif-msg', '网络错误：' + e, 'error');
+    } finally {
+      isResending = false;
+    }
   };
   // 点击遮罩关闭
   backdrop.addEventListener('click', (e) => { if (e.target === backdrop) backdrop.remove(); });
@@ -736,6 +791,14 @@ if (TOKEN) {
       }
     }).catch(() => {});
 }
+
+// Ctrl+Enter 快捷发送通知
+document.addEventListener('keydown', function(e) {
+  if (e.ctrlKey && e.key === 'Enter' && document.activeElement.id === 'notif-content') {
+    e.preventDefault();
+    sendNotification();
+  }
+});
 </script>
 </body>
 </html>
