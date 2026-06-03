@@ -8,76 +8,58 @@ from fastapi.responses import StreamingResponse
 from typing import Optional
 from pydantic import BaseModel
 from app.database import db
-from app.auth_utils import create_token, require_teacher
-        from datetime import datetime
-        for e in exams:
-            # 优先使用 upstream 的 grading_records/submissions 统计（更通用）；失败时回退到 scores 表（feature 分支）
-            submitted = 0
-            avg = None
-            try:
-                cur.execute("""
-                    SELECT COUNT(DISTINCT sub.student_user_id) AS cnt
-                    FROM grading_records gr
-                    JOIN submissions sub ON gr.submission_id = sub.id
-                    JOIN assignments a ON sub.assignment_id = a.id
-                    WHERE a.course_id = %s AND a.title LIKE CONCAT('exam_', %s, '%%')
-                """, (COURSE_ID, str(e["id"])))
-                row = cur.fetchone()
-                submitted = row["cnt"] or 0
+from app.auth_utils import create_token, hash_password, verify_teacher_token, require_teacher
+from app.sync_exams import sync_exams
+from pypinyin import lazy_pinyin, Style
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
 
-                cur.execute("""
-                    SELECT AVG(gr.exam_score) AS avg
-                    FROM grading_records gr
-                    JOIN submissions sub ON gr.submission_id = sub.id
-                    JOIN assignments a ON sub.assignment_id = a.id
-                    WHERE a.course_id = %s AND a.title LIKE CONCAT('exam_', %s, '%%')
-                """, (COURSE_ID, str(e["id"])))
-                avg_row = cur.fetchone()
-                avg = avg_row["avg"]
-            except Exception:
-                # 回退到 legacy 的 scores 表
-                try:
-                    cur.execute("SELECT COUNT(*) AS cnt FROM scores WHERE exam_id = %s", (e["id"],))
-                    submitted = cur.fetchone()["cnt"] or 0
-                except Exception:
-                    submitted = 0
-                try:
-                    cur.execute("SELECT AVG(score) AS avg FROM scores WHERE exam_id = %s", (e["id"],))
-                    avg_row = cur.fetchone()
-                    avg = avg_row["avg"]
-                except Exception:
-                    avg = None
+router = APIRouter()
 
-            # 尝试根据 classroom_exams 的时间判断状态（开放中 / 已关闭），找不到则以 is_active 回退
-            status = None
-            try:
-                cur.execute("SELECT start_at, end_at FROM classroom_exams WHERE id = %s", (e["id"],))
-                ce = cur.fetchone()
-                if ce and ce.get("start_at") and ce.get("end_at"):
-                    try:
-                        now = datetime.now()
-                        start = datetime.strptime(str(ce["start_at"]), "%Y-%m-%d %H:%M:%S")
-                        end = datetime.strptime(str(ce["end_at"]), "%Y-%m-%d %H:%M:%S")
-                        status = "active" if (now >= start and now <= end) else "ended"
-                    except Exception:
-                        status = "unknown"
-                else:
-                    status = "active" if e.get("is_active", 1) == 1 else "ended"
-            except Exception:
-                status = "active" if e.get("is_active", 1) == 1 else "ended"
+TEACHER_PASSWORD = os.environ.get("TEACHER_PASSWORD", "admin123")
+COURSE_ID = int(os.environ.get("COURSE_ID", "1"))
 
-            result.append({
-                "id": str(e["id"]),
-                "title": e["title"],
-                "is_active": 1,
-                "exam_type": e["exam_type"],
-                "start_at": e["start_at"].strftime("%Y-%m-%d %H:%M:%S") if e["start_at"] else None,
-                "end_at": e["end_at"].strftime("%Y-%m-%d %H:%M:%S") if e["end_at"] else None,
-                "submitted": submitted,
-                "total_students": total_students,
-                "avg_score": round(float(avg), 1) if avg else None,
-                "status": status,
-            })
+
+def _name_to_pinyin(name: str):
+    full = "".join(lazy_pinyin(name, style=Style.NORMAL))
+    abbr = "".join(lazy_pinyin(name, style=Style.FIRST_LETTER))
+    return full.lower(), abbr.lower()
+
+
+def _list_students_with_class(conn):
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT u.full_name AS name, u.student_no AS student_id,
+               u.id AS user_id, COALESCE(s.class_name, '') AS class_name
+        FROM users u
+        JOIN students s ON s.user_id = u.id
+        JOIN enrollments e ON e.student_user_id = u.id
+        WHERE u.role = 'student' AND e.course_id = %s
+        ORDER BY u.student_no
+    """, (COURSE_ID,))
+    return cur.fetchall()
+
+
+def _get_enrolled_student_count(conn):
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COUNT(*) AS cnt FROM enrollments WHERE course_id = %s",
+        (COURSE_ID,)
+    )
+    return cur.fetchone()["cnt"]
+
+
+class LoginRequest(BaseModel):
+    password: str
+
+
+@router.post("/api/teacher/login")
+def teacher_login(req: LoginRequest):
+    if req.password != TEACHER_PASSWORD:
+        raise HTTPException(status_code=401, detail="密码错误")
+    token = create_token({"role": "teacher", "name": "teacher"})
+    return {"token": token}
+
 
 @router.post("/api/teacher/students")
 async def upload_students(
@@ -117,7 +99,6 @@ async def upload_students(
         count = 0
         for name, student_no, class_name in records:
             email = f"{student_no}@stu.oaepp.dev"
-            # 插入或更新 users 表
             cur.execute("""
                 INSERT INTO users (role, student_no, email, password_hash, full_name)
                 VALUES ('student', %s, %s, '', %s)
@@ -128,14 +109,12 @@ async def upload_students(
                 cur.execute("SELECT id FROM users WHERE student_no = %s", (student_no,))
                 user_id = cur.fetchone()["id"]
 
-            # 插入或更新 students 表
             cur.execute("""
                 INSERT INTO students (user_id, class_name)
                 VALUES (%s, %s)
                 ON DUPLICATE KEY UPDATE class_name = VALUES(class_name)
             """, (user_id, class_name))
 
-            # 选课
             cur.execute("""
                 INSERT IGNORE INTO enrollments (course_id, student_user_id)
                 VALUES (%s, %s)
@@ -162,7 +141,6 @@ def add_student(req: AddStudentRequest, authorization: Optional[str] = Header(No
 
     with db() as conn:
         cur = conn.cursor()
-        # 检查是否已存在
         cur.execute(
             "SELECT u.full_name FROM users u WHERE u.student_no = %s",
             (req.student_id,)
@@ -187,6 +165,10 @@ def add_student(req: AddStudentRequest, authorization: Optional[str] = Header(No
             "INSERT IGNORE INTO enrollments (course_id, student_user_id) VALUES (%s, %s)",
             (COURSE_ID, user_id)
         )
+        cur.execute(
+            "INSERT INTO student_accounts (student_id, password_hash) VALUES (%s, %s)",
+            (req.student_id, hash_password(req.student_id)),
+        )
     return {"ok": True}
 
 
@@ -204,7 +186,6 @@ def delete_student(student_id: str, authorization: Optional[str] = Header(None))
         if not student:
             raise HTTPException(status_code=404, detail="学号不存在")
 
-        # 取消选课
         cur.execute(
             "DELETE FROM enrollments WHERE course_id = %s AND student_user_id = %s",
             (COURSE_ID, student["id"])
@@ -262,7 +243,6 @@ def list_exams(authorization: Optional[str] = Header(None)):
         """, (COURSE_ID,))
         exams = cur.fetchall()
 
-    # 懒加载同步
     if not exams:
         print("[list_exams] 考试表为空，触发懒加载同步…")
         sync_exams()
@@ -278,28 +258,57 @@ def list_exams(authorization: Optional[str] = Header(None)):
         cur = conn.cursor()
         total_students = _get_enrolled_student_count(conn)
         result = []
-        from datetime import datetime
         for e in exams:
-            # 统计该考试已提交人数
-            cur.execute("""
-                SELECT COUNT(DISTINCT sub.student_user_id) AS cnt
-                FROM grading_records gr
-                JOIN submissions sub ON gr.submission_id = sub.id
-                JOIN assignments a ON sub.assignment_id = a.id
-                WHERE a.course_id = %s AND a.title LIKE CONCAT('exam_', %s, '%%')
-            """, (COURSE_ID, str(e["id"])))
-            submitted = cur.fetchone()["cnt"] or 0
+            submitted = 0
+            avg = None
+            try:
+                cur.execute("""
+                    SELECT COUNT(DISTINCT sub.student_user_id) AS cnt
+                    FROM grading_records gr
+                    JOIN submissions sub ON gr.submission_id = sub.id
+                    JOIN assignments a ON sub.assignment_id = a.id
+                    WHERE a.course_id = %s AND a.title LIKE CONCAT('exam_', %s, '%%')
+                """, (COURSE_ID, str(e["id"])))
+                submitted = cur.fetchone()["cnt"] or 0
 
-            # 统计该考试平均分
-            cur.execute("""
-                SELECT AVG(gr.exam_score) AS avg
-                FROM grading_records gr
-                JOIN submissions sub ON gr.submission_id = sub.id
-                JOIN assignments a ON sub.assignment_id = a.id
-                WHERE a.course_id = %s AND a.title LIKE CONCAT('exam_', %s, '%%')
-            """, (COURSE_ID, str(e["id"])))
-            avg_row = cur.fetchone()
-            avg = avg_row["avg"]
+                cur.execute("""
+                    SELECT AVG(gr.exam_score) AS avg
+                    FROM grading_records gr
+                    JOIN submissions sub ON gr.submission_id = sub.id
+                    JOIN assignments a ON sub.assignment_id = a.id
+                    WHERE a.course_id = %s AND a.title LIKE CONCAT('exam_', %s, '%%')
+                """, (COURSE_ID, str(e["id"])))
+                avg_row = cur.fetchone()
+                avg = avg_row["avg"]
+            except Exception:
+                try:
+                    cur.execute("SELECT COUNT(*) AS cnt FROM scores WHERE exam_id = %s", (e["id"],))
+                    submitted = cur.fetchone()["cnt"] or 0
+                except Exception:
+                    submitted = 0
+                try:
+                    cur.execute("SELECT AVG(score) AS avg FROM scores WHERE exam_id = %s", (e["id"],))
+                    avg_row = cur.fetchone()
+                    avg = avg_row["avg"]
+                except Exception:
+                    avg = None
+
+            status = None
+            try:
+                cur.execute("SELECT start_at, end_at FROM classroom_exams WHERE id = %s", (e["id"],))
+                ce = cur.fetchone()
+                if ce and ce.get("start_at") and ce.get("end_at"):
+                    try:
+                        now = datetime.now()
+                        start = datetime.strptime(str(ce["start_at"]), "%Y-%m-%d %H:%M:%S")
+                        end = datetime.strptime(str(ce["end_at"]), "%Y-%m-%d %H:%M:%S")
+                        status = "active" if (now >= start and now <= end) else "ended"
+                    except Exception:
+                        status = "unknown"
+                else:
+                    status = "active" if e.get("is_active", 1) == 1 else "ended"
+            except Exception:
+                status = "active" if e.get("is_active", 1) == 1 else "ended"
 
             result.append({
                 "id": str(e["id"]), "title": e["title"], "is_active": 1,
@@ -308,6 +317,7 @@ def list_exams(authorization: Optional[str] = Header(None)):
                 "end_at": e["end_at"].strftime("%Y-%m-%d %H:%M:%S") if e["end_at"] else None,
                 "submitted": submitted, "total_students": total_students,
                 "avg_score": round(float(avg), 1) if avg else None,
+                "status": status,
             })
     return result
 
@@ -347,13 +357,14 @@ def update_exam(exam_id: str, req: ExamUpdate, authorization: Optional[str] = He
     require_teacher(authorization)
     with db() as conn:
         cur = conn.cursor()
-        if req.is_active == 0:
-            cur.execute("UPDATE exams SET end_at = NOW() WHERE id = %s", (exam_id,))
-        else:
-            cur.execute(
-                "UPDATE exams SET end_at = DATE_ADD(NOW(), INTERVAL 7 DAY) WHERE id = %s",
-                (exam_id,)
-            )
+        if req.title:
+            cur.execute("UPDATE exams SET title = %s WHERE id = %s", (req.title, exam_id))
+        if req.exam_type:
+            cur.execute("UPDATE exams SET exam_type = %s WHERE id = %s", (req.exam_type, exam_id))
+        if req.start_at:
+            cur.execute("UPDATE exams SET start_at = %s WHERE id = %s", (req.start_at, exam_id))
+        if req.end_at:
+            cur.execute("UPDATE exams SET end_at = %s WHERE id = %s", (req.end_at, exam_id))
     return {"ok": True}
 
 
@@ -370,7 +381,6 @@ def get_scores(exam_id: str = Query(...), authorization: Optional[str] = Header(
 
         students = _list_students_with_class(conn)
 
-        # 获取成绩（通过 assignment.title 关联 exam_id）
         cur.execute("""
             SELECT sub.student_user_id, gr.exam_score AS score, gr.total_score AS total, gr.graded_at AS submitted_at
             FROM grading_records gr
@@ -465,7 +475,7 @@ def export_scores(exam_id: int = Query(...), authorization: Optional[str] = Head
 @router.post("/api/teacher/exams/cleanup")
 def cleanup_exams(req: CleanupRequest, authorization: Optional[str] = Header(None)):
     """删除指定标题的考试（慎用）。若未提供 titles，则删除已知的三条错误记录。"""
-    _require_teacher(authorization)
+    require_teacher(authorization)
     defaults = [
         "第 12 章 机器人系统开发环境配置 测验",
         "第二章 CubeMX 编程测验",
@@ -490,7 +500,7 @@ def cleanup_exams(req: CleanupRequest, authorization: Optional[str] = Header(Non
 @router.delete("/api/teacher/exams/{exam_id}")
 def delete_exam(exam_id: str, authorization: Optional[str] = Header(None)):
     """删除某次考试及其相关记录（scores、classroom_exams、questions、attempts）。"""
-    _require_teacher(authorization)
+    require_teacher(authorization)
     affected = 0
     with db() as conn:
         cur = conn.execute("DELETE FROM scores WHERE exam_id=%s", (exam_id,))
@@ -505,6 +515,7 @@ def delete_exam(exam_id: str, authorization: Optional[str] = Header(None)):
             conn.execute("DELETE FROM classroom_exams WHERE id=%s", (eid,))
             affected += 1
     return {"ok": True, "deleted": affected}
+
 
 # ───── GitHub 账号绑定状态看板 (F-T-004) ─────
 
@@ -649,12 +660,11 @@ def send_binding_reminder(req: BatchStudentIds, authorization: Optional[str] = H
 
 # ───── 进度看板 API (F-T-013) ─────
 
-# 热力图状态常量
 HEATMAP_STATUS = {
-    "submitted": "绿",      # 已提交
-    "late": "黄",          # 迟交
-    "missing": "红",        # 未提交
-    "not_published": "灰"  # 任务未发布
+    "submitted": "绿",
+    "late": "黄",
+    "missing": "红",
+    "not_published": "灰"
 }
 
 
@@ -662,7 +672,7 @@ class ProgressFilter(BaseModel):
     """进度看板筛选参数"""
     course_id: Optional[int] = None
     semester: Optional[str] = None
-    top_n_lowest: Optional[int] = 5  # 完成率最低的前N名置顶高亮
+    top_n_lowest: Optional[int] = 5
 
 
 @router.get("/api/teacher/progress/heatmap")
@@ -671,33 +681,19 @@ def get_progress_heatmap(
     semester: Optional[str] = Query(None),
     authorization: Optional[str] = Header(None)
 ):
-    """
-    获取热力图数据：学生（行）× 任务（列）二维完成状态矩阵
-    
-    返回格式：
-    {
-        "students": [{"id": 1, "name": "张三", "student_id": "2021001", "class_name": "计算机1班"}, ...],
-        "assignments": [{"id": 1, "title": "第一章作业", "deadline": "2026-06-10"}, ...],
-        "matrix": [
-            [{"assignment_id": 1, "student_id": 1, "status": "submitted"}, ...],
-            ...
-        ]
-    }
-    """
+    """获取热力图数据：学生（行）× 任务（列）二维完成状态矩阵"""
     require_teacher(authorization)
-    
+
     with db() as conn:
-        # 查询学生列表
         student_query = """
-            SELECT s.user_id AS student_id, u.full_name AS name, 
+            SELECT s.user_id AS student_id, u.full_name AS name,
                    u.student_no, COALESCE(s.class_name, '') AS class_name
             FROM students s
             JOIN users u ON s.user_id = u.id
             WHERE u.role = 'student'
         """
         students = conn.execute(student_query).fetchall()
-        
-        # 查询作业列表
+
         assignment_query = """
             SELECT a.id, a.title, a.deadline, a.created_at, a.course_id,
                    c.name AS course_name
@@ -712,44 +708,40 @@ def get_progress_heatmap(
             assignment_query += " AND c.term = %s" if course_id else " WHERE c.term = %s"
             params.append(semester)
         assignment_query += " ORDER BY a.deadline"
-        
+
         assignments = conn.execute(assignment_query, params).fetchall()
-        
+
         if not assignments:
             return {"students": [], "assignments": [], "matrix": []}
-        
-        # 查询提交状态
+
         assignment_ids = [a["id"] for a in assignments]
         student_ids = [s["student_id"] for s in students]
-        
+
         if not assignment_ids or not student_ids:
             return {"students": [], "assignments": [], "matrix": []}
-        
-        # 构建查询条件
+
         placeholders_a = ",".join(["%s"] * len(assignment_ids))
         placeholders_s = ",".join(["%s"] * len(student_ids))
-        
+
         submissions = conn.execute(f"""
-            SELECT sub.assignment_id, sub.student_user_id, sub.is_late, 
+            SELECT sub.assignment_id, sub.student_user_id, sub.is_late,
                    sub.submitted_at, sub.version_no, sub.grading_status
             FROM submissions sub
             WHERE sub.assignment_id IN ({placeholders_a})
             AND sub.student_user_id IN ({placeholders_s})
             AND sub.version_no = (
-                SELECT MAX(s2.version_no) 
-                FROM submissions s2 
-                WHERE s2.assignment_id = sub.assignment_id 
+                SELECT MAX(s2.version_no)
+                FROM submissions s2
+                WHERE s2.assignment_id = sub.assignment_id
                 AND s2.student_user_id = sub.student_user_id
             )
         """, assignment_ids + student_ids).fetchall()
-        
-        # 构建提交映射：(assignment_id, student_id) -> submission
+
         submission_map = {
             (str(s["assignment_id"]), str(s["student_user_id"])): dict(s)
             for s in submissions
         }
-        
-        # 构建矩阵数据
+
         now = datetime.now()
         matrix = []
         for student in students:
@@ -757,9 +749,8 @@ def get_progress_heatmap(
             for assignment in assignments:
                 key = (str(assignment["id"]), str(student["student_id"]))
                 sub = submission_map.get(key)
-                
+
                 if sub:
-                    # 有提交记录
                     if sub["is_late"]:
                         status = "late"
                     else:
@@ -773,7 +764,6 @@ def get_progress_heatmap(
                         "grading_status": sub["grading_status"]
                     }
                 elif assignment["deadline"] < now:
-                    # 截止时间已过且未提交
                     cell = {
                         "assignment_id": assignment["id"],
                         "student_id": student["student_id"],
@@ -783,7 +773,6 @@ def get_progress_heatmap(
                         "grading_status": None
                     }
                 else:
-                    # 任务未发布（截止时间未到）
                     cell = {
                         "assignment_id": assignment["id"],
                         "student_id": student["student_id"],
@@ -800,7 +789,7 @@ def get_progress_heatmap(
                 "class_name": student["class_name"],
                 "cells": row
             })
-        
+
         return {
             "students": [dict(s) for s in students],
             "assignments": [dict(a) for a in assignments],
@@ -814,26 +803,17 @@ def get_progress_chart(
     semester: Optional[str] = Query(None),
     authorization: Optional[str] = Header(None)
 ):
-    """
-    获取柱状图数据：各任务在全班的完成率趋势
-    
-    返回格式：
-    {
-        "tasks": [{"id": 1, "title": "第一章作业", "deadline": "2026-06-10", "completion_rate": 0.75}, ...]
-    }
-    """
+    """获取柱状图数据：各任务在全班的完成率趋势"""
     require_teacher(authorization)
-    
+
     with db() as conn:
-        # 获取总学生数
         total_students = conn.execute(
             "SELECT COUNT(*) AS cnt FROM users WHERE role='student'"
         ).fetchone()["cnt"]
-        
+
         if total_students == 0:
             return {"tasks": []}
-        
-        # 查询作业列表
+
         assignment_query = """
             SELECT a.id, a.title, a.deadline, a.created_at, a.course_id,
                    c.name AS course_name
@@ -848,33 +828,30 @@ def get_progress_chart(
             assignment_query += " AND c.term = %s" if course_id else " WHERE c.term = %s"
             params.append(semester)
         assignment_query += " ORDER BY a.deadline"
-        
+
         assignments = conn.execute(assignment_query, params).fetchall()
-        
+
         if not assignments:
             return {"tasks": []}
-        
-        # 查询每个作业的提交数量
+
         now = datetime.now()
         tasks = []
         for a in assignments:
             assignment_id = a["id"]
-            
-            # 获取该作业的最新提交（每个学生只算一次）
+
             submitted_count = conn.execute("""
                 SELECT COUNT(DISTINCT student_user_id) AS cnt
                 FROM submissions
                 WHERE assignment_id = %s
             """, (assignment_id,)).fetchone()["cnt"]
-            
-            # 判断是否已截止
+
             is_past_deadline = a["deadline"] < now
-            
+
             if is_past_deadline:
                 completion_rate = submitted_count / total_students if total_students > 0 else 0
             else:
-                completion_rate = None  # 未截止的任务不计算完成率
-            
+                completion_rate = None
+
             tasks.append({
                 "id": assignment_id,
                 "title": a["title"],
@@ -886,7 +863,7 @@ def get_progress_chart(
                 "completion_rate": round(completion_rate, 2) if completion_rate is not None else None,
                 "is_past_deadline": is_past_deadline
             })
-        
+
         return {"tasks": tasks}
 
 
@@ -898,26 +875,14 @@ def get_progress_matrix(
     sort_order: str = Query("completion_asc", description="排序方式"),
     authorization: Optional[str] = Header(None)
 ):
-    """
-    获取完整的进度矩阵数据，包含排序（完成率最低的前N名置顶高亮）
-    
-    返回格式（兼容前端期望的exams字段）：
-    {
-        "students": [...],
-        "exams": [...],
-        "matrix": [...]
-    }
-    """
+    """获取完整的进度矩阵数据，包含排序（完成率最低的前N名置顶高亮）"""
     require_teacher(authorization)
-    
-    # 获取热力图数据
+
     heatmap_data = get_progress_heatmap(course_id=course_id, semester=semester, authorization=authorization)
-    
-    # 转换assignments为exams格式（前端期望的字段名）
+
     exams = []
     for assn in heatmap_data["assignments"]:
         deadline = assn.get("deadline", "")
-        # deadline可能是datetime对象或字符串
         if isinstance(deadline, datetime):
             deadline_str = deadline.strftime("%Y-%m-%d %H:%M:%S")
             is_active = datetime.now() >= deadline
@@ -931,7 +896,7 @@ def get_progress_matrix(
         else:
             deadline_str = ""
             is_active = False
-            
+
         exams.append({
             "id": f"hw{assn['id']}",
             "title": assn["title"],
@@ -943,15 +908,12 @@ def get_progress_matrix(
             "submitted": 0,
             "completion_rate": 0.0
         })
-    
-    # 构建学生数据（包含statuses字段，前端需要）
-    now = datetime.now()
+
     students = []
     for row in heatmap_data["matrix"]:
         student_id = row["student_id"]
         cells = row["cells"]
-        
-        # 构建statuses字典
+
         statuses = {}
         for idx, cell in enumerate(cells):
             exam_id = f"hw{heatmap_data['assignments'][idx]['id']}"
@@ -962,25 +924,24 @@ def get_progress_matrix(
                 "not_published": "not_published"
             }
             status = status_map.get(cell["status"], "not_published")
-            
+
             status_info = {"status": status}
             if cell.get("submitted_at"):
                 status_info["submitted_at"] = cell["submitted_at"]
             if cell.get("score") is not None:
                 status_info["score"] = cell["score"]
                 status_info["total"] = 100
-            
+
             statuses[exam_id] = status_info
-        
-        # 计算完成率
+
         completed = sum(1 for c in cells if c["status"] in ["submitted", "late"])
         past_deadline = sum(1 for c in cells if c["status"] in ["submitted", "late", "missing"])
-        
+
         if past_deadline > 0:
             completion_rate = completed / past_deadline
         else:
             completion_rate = 1.0
-        
+
         students.append({
             "student_id": student_id,
             "name": row["name"],
@@ -990,18 +951,15 @@ def get_progress_matrix(
             "highlight": False,
             "statuses": statuses
         })
-    
-    # 排序
+
     if sort_order == "completion_asc":
         students.sort(key=lambda x: x["completion_rate"])
     else:
         students.sort(key=lambda x: x["name"])
-    
-    # 高亮前N名
+
     for i, student in enumerate(students):
         student["highlight"] = i < bottom_n and student["completion_rate"] < 1.0
-    
-    # 更新exams的完成率统计
+
     for exam in exams:
         submitted = 0
         for student in students:
@@ -1010,7 +968,7 @@ def get_progress_matrix(
                 submitted += 1
         exam["submitted"] = submitted
         exam["completion_rate"] = round(submitted / len(students), 3) if students else 0.0
-    
+
     return {
         "students": students,
         "exams": exams,
@@ -1024,40 +982,21 @@ def get_submission_detail(
     assignment_id: int,
     authorization: Optional[str] = Header(None)
 ):
-    """
-    获取学生某任务的提交详情
-    
-    返回格式：
-    {
-        "student": {"id": 1, "name": "张三", "student_no": "2021001", "class_name": "计算机1班"},
-        "assignment": {"id": 1, "title": "第一章作业", "deadline": "2026-06-10"},
-        "submission": {
-            "id": 1,
-            "version_no": 2,
-            "is_late": false,
-            "submitted_at": "2026-06-09T10:30:00",
-            "grading_status": "graded",
-            "file_url": "...",
-            "text_content": "..."
-        } or None
-    }
-    """
+    """获取学生某任务的提交详情"""
     require_teacher(authorization)
-    
+
     with db() as conn:
-        # 获取学生信息
         student = conn.execute("""
-            SELECT s.user_id AS student_id, u.full_name AS name, 
+            SELECT s.user_id AS student_id, u.full_name AS name,
                    u.student_no, COALESCE(s.class_name, '') AS class_name
             FROM students s
             JOIN users u ON s.user_id = u.id
             WHERE u.role = 'student' AND s.user_id = %s
         """, (student_user_id,)).fetchone()
-        
+
         if not student:
             raise HTTPException(status_code=404, detail="学生不存在")
-        
-        # 获取作业信息
+
         assignment = conn.execute("""
             SELECT a.id, a.title, a.deadline, a.description_md, a.late_policy,
                    c.name AS course_name
@@ -1065,11 +1004,10 @@ def get_submission_detail(
             JOIN courses c ON a.course_id = c.id
             WHERE a.id = %s
         """, (assignment_id,)).fetchone()
-        
+
         if not assignment:
             raise HTTPException(status_code=404, detail="作业不存在")
-        
-        # 获取最新的提交记录
+
         submission = conn.execute("""
             SELECT id, version_no, is_late, submitted_at, grading_status,
                    file_url, text_content
@@ -1078,7 +1016,7 @@ def get_submission_detail(
             ORDER BY version_no DESC
             LIMIT 1
         """, (assignment_id, student_user_id)).fetchone()
-        
+
         return {
             "student": dict(student),
             "assignment": {
@@ -1097,21 +1035,14 @@ def get_submission_detail(
 def get_progress_courses(
     authorization: Optional[str] = Header(None)
 ):
-    """
-    获取可用于进度看板筛选的课程列表
-    
-    返回格式：
-    {
-        "courses": [{"id": 1, "code": "CS2026-PYTHON", "name": "Python程序设计", "term": "2026-春"}, ...]
-    }
-    """
+    """获取可用于进度看板筛选的课程列表"""
     require_teacher(authorization)
-    
+
     with db() as conn:
         courses = conn.execute("""
             SELECT id, code, name, term
             FROM courses
             ORDER BY term DESC, code
         """).fetchall()
-    
+
     return {"courses": [dict(c) for c in courses]}
