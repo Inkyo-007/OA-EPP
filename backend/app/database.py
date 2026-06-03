@@ -94,6 +94,32 @@ def db():
         conn.close()
 
 
+def _migrate_chapters(conn):
+    """幂等地为旧 chapters 表补充 F-S-011 字段（MySQL 版）"""
+    conn.execute("SHOW COLUMNS FROM chapters")
+    existing = {row["Field"] for row in conn.fetchall()}
+    for col, ddl in {
+        "chapter_type":     "ALTER TABLE chapters ADD COLUMN chapter_type     VARCHAR(50) DEFAULT '作业'",
+        "deadline":         "ALTER TABLE chapters ADD COLUMN deadline         VARCHAR(50) DEFAULT ''",
+        "status":           "ALTER TABLE chapters ADD COLUMN status           VARCHAR(50) DEFAULT '待开始'",
+        "grading_criteria": "ALTER TABLE chapters ADD COLUMN grading_criteria TEXT",
+    }.items():
+        if col not in existing:
+            conn.execute(ddl)
+
+
+def _migrate_courses(conn):
+    """幂等地为旧 courses 表补充总分/截止提醒字段（MySQL 版）"""
+    conn.execute("SHOW COLUMNS FROM courses")
+    existing = {row["Field"] for row in conn.fetchall()}
+    for col, ddl in {
+        "total_score":       "ALTER TABLE courses ADD COLUMN total_score       INT DEFAULT 100",
+        "deadline_reminder": "ALTER TABLE courses ADD COLUMN deadline_reminder VARCHAR(255) DEFAULT ''",
+    }.items():
+        if col not in existing:
+            conn.execute(ddl)
+
+
 def init_db():
     """Create tables if they don't exist. DDL may fail on shared DB with restricted permissions — that's OK."""
     with db() as conn:
@@ -140,6 +166,38 @@ def init_db():
 
         try:
             conn.execute("""
+                CREATE TABLE IF NOT EXISTS courses (
+                    id                VARCHAR(100) PRIMARY KEY,
+                    title             VARCHAR(255) NOT NULL,
+                    semester          VARCHAR(50) DEFAULT '',
+                    total_score       INT DEFAULT 100,
+                    deadline_reminder VARCHAR(255) DEFAULT '',
+                    is_active         TINYINT DEFAULT 1
+                )
+            """)
+        except Exception as e:
+            print(f"[init_db] courses table skipped: {e}")
+
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS chapters (
+                    id               VARCHAR(100) PRIMARY KEY,
+                    course_id        VARCHAR(100) NOT NULL,
+                    chapter_no       INT NOT NULL,
+                    title            VARCHAR(255) NOT NULL,
+                    filename         VARCHAR(255) NOT NULL,
+                    file_path        VARCHAR(512) NOT NULL,
+                    chapter_type     VARCHAR(50) DEFAULT '作业',
+                    deadline         VARCHAR(50) DEFAULT '',
+                    status           VARCHAR(50) DEFAULT '待开始',
+                    grading_criteria TEXT
+                )
+            """)
+        except Exception as e:
+            print(f"[init_db] chapters table skipped: {e}")
+
+        try:
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS timeline_events (
                     id           INT AUTO_INCREMENT PRIMARY KEY,
                     student_id   VARCHAR(100) NOT NULL,
@@ -170,6 +228,9 @@ def init_db():
             """)
         except Exception as e:
             print(f"[init_db] github_bindings table skipped: {e}")
+
+        _migrate_chapters(conn)
+        _migrate_courses(conn)
 
 
 def seed_timeline_events():
