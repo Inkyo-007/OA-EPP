@@ -75,6 +75,35 @@
   .confirm-dialog h3 { margin-bottom: 10px; }
   .confirm-dialog p { color: #666; font-size: .9rem; margin-bottom: 20px; line-height: 1.6; }
   .confirm-dialog .btn-row { display: flex; gap: 10px; justify-content: center; }
+  /* 通知模块样式 */
+  .notif-form-row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 16px; }
+  .notif-form-row .field { display: flex; flex-direction: column; gap: 4px; }
+  .notif-form-row .field input, .notif-form-row .field select, .notif-form-row .field textarea { padding: 10px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: .95rem; }
+  .notif-form-row .field input:focus, .notif-form-row .field select:focus, .notif-form-row .field textarea:focus { outline: none; border-color: #1565c0; }
+  .notif-form-row .field textarea { resize: vertical; min-height: 60px; }
+  .notif-item { border-bottom: 1px solid #f0f0f0; overflow: hidden; }
+  .notif-item:last-child { border-bottom: none; }
+  .notif-item .notif-summary { padding: 12px 0; cursor: pointer; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .notif-item .notif-summary:hover { background: #fafafa; }
+  .notif-item .notif-info { flex: 1; min-width: 0; }
+  .notif-item .notif-title { font-weight: bold; font-size: .95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .notif-item .notif-meta { font-size: .8rem; color: #888; margin-top: 2px; }
+  .notif-item .notif-arrow { font-size: .8rem; color: #bbb; transition: transform .2s; flex-shrink: 0; }
+  .notif-item.expanded .notif-arrow { transform: rotate(180deg); }
+  .notif-item .notif-detail { display: none; padding: 0 0 14px 0; border-top: 1px solid #f0f0f0; }
+  .notif-item.expanded .notif-detail { display: block; }
+  .notif-item .notif-body { font-size: .88rem; color: #555; line-height: 1.7; padding: 10px 0; white-space: pre-wrap; }
+  .notif-item .notif-actions { display: flex; gap: 8px; }
+  .notif-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+  .notif-tab { padding: 5px 14px; border-radius: 16px; border: 1px solid #1565c0; color: #1565c0; cursor: pointer; font-size: .82rem; background: #fff; transition: all .2s; }
+  .notif-tab:hover { background: #e3f2fd; }
+  .notif-tab.active { background: #1565c0; color: #fff; }
+  .notif-category { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: .75rem; font-weight: bold; }
+  .notif-cat-announcement { background: #e3f2fd; color: #1565c0; }
+  .notif-cat-deadline { background: #fff3e0; color: #e65100; }
+  .notif-cat-grade { background: #e8f5e9; color: #2e7d32; }
+  .notif-cat-system { background: #f3e5f5; color: #7b1fa2; }
+  .notif-cat-graded { background: #e8f5e9; color: #2e7d32; }
   #app { display: none; }
 </style>
 </head>
@@ -206,6 +235,51 @@
       </div>
     </div>
 
+    <!-- 公告与通知管理 -->
+    <div class="card">
+      <div class="card-title">📢 公告与通知管理</div>
+      <div class="card-body">
+        <div id="notif-msg"></div>
+
+        <!-- 发送通知表单 -->
+        <div id="notif-form" style="margin-bottom:20px;padding:16px;background:#f8f9fa;border-radius:8px;">
+          <p style="font-size:.9rem;font-weight:bold;margin-bottom:12px;color:#555">✉️ 发送新通知</p>
+          <div class="notif-form-row">
+            <div class="field" style="flex:2;min-width:200px;">
+              <label class="form-label">标题 *</label>
+              <input type="text" id="notif-title" placeholder="如：期末考试成绩已公布" maxlength="200" onkeydown="if(event.key==='Enter' && event.ctrlKey)sendNotification()">
+            </div>
+            <div class="field" style="min-width:140px;">
+              <label class="form-label">分类</label>
+              <select id="notif-category">
+                <option value="announcement">📋 公告</option>
+                <option value="deadline">⏰ 截止提醒</option>
+                <option value="grade">📊 成绩通知</option>
+              </select>
+            </div>
+            <button class="btn btn-primary btn-sm" style="height:42px;align-self:flex-end;white-space:nowrap" onclick="sendNotification()">发送通知</button>
+          </div>
+          <div class="field" style="margin-top:8px;">
+            <label class="form-label">通知内容 *</label>
+            <textarea id="notif-content" rows="3" placeholder="输入通知正文…（Ctrl+Enter 快速发送）"></textarea>
+          </div>
+          <p style="font-size:.78rem;color:#888;margin-top:6px">通知将发送给所有已注册的学生 · Ctrl+Enter 快速发送</p>
+        </div>
+
+        <!-- 已发通知列表 -->
+        <div>
+          <p style="font-size:.9rem;font-weight:bold;margin-bottom:8px;color:#555">📋 已发送的通知</p>
+          <div class="notif-tabs" id="tnotif-tabs">
+            <button class="notif-tab active" data-cat="all" onclick="switchTeacherNotifCat('all')">全部</button>
+            <button class="notif-tab" data-cat="announcement" onclick="switchTeacherNotifCat('announcement')">📋 公告</button>
+            <button class="notif-tab" data-cat="deadline" onclick="switchTeacherNotifCat('deadline')">⏰ 截止提醒</button>
+            <button class="notif-tab" data-cat="grade" onclick="switchTeacherNotifCat('grade')">📊 成绩通知</button>
+          </div>
+          <div id="notif-list" style="max-height:400px;overflow-y:auto;">加载中…</div>
+        </div>
+      </div>
+    </div>
+
     <!-- 进度看板（可展开） -->
     <div class="card" id="progress-board-card">
       <div class="card-title" style="cursor:pointer;background:linear-gradient(135deg, #e3f2fd, #bbdefb);" onclick="toggleProgressBoard()">
@@ -281,6 +355,7 @@ async function doLogin() {
     document.getElementById('app').style.display = 'block';
     loadExams();
     loadStudentList();
+    loadNotificationList();
     loadBindingDashboard();
   } catch(e) { showMsg('login-msg', '网络错误：' + e, 'error'); }
 }
@@ -552,6 +627,249 @@ function showConfirmDialog(title, message, onConfirm) {
   backdrop.querySelector('#confirm-ok').onclick = () => { backdrop.remove(); onConfirm(); };
 }
 
+// ───── 公告与通知管理 ─────
+
+const CATEGORY_LABELS = {
+  announcement: '公告', deadline: '截止提醒', grade: '成绩通知',
+  system: '系统', graded: '已批改'
+};
+
+let isSendingNotification = false;
+
+async function sendNotification() {
+  // 防重复点击
+  if (isSendingNotification) return;
+
+  const title = document.getElementById('notif-title').value.trim();
+  const content = document.getElementById('notif-content').value.trim();
+  const category = document.getElementById('notif-category').value;
+  if (!title) { showMsg('notif-msg', '请输入通知标题', 'error'); return; }
+  if (!content) { showMsg('notif-msg', '请输入通知内容', 'error'); return; }
+
+  // 字符长度校验
+  if (title.length > 200) { showMsg('notif-msg', '标题不能超过 200 个字符', 'error'); return; }
+  if (content.length > 5000) { showMsg('notif-msg', '内容不能超过 5000 个字符', 'error'); return; }
+
+  // 设置 loading 状态
+  isSendingNotification = true;
+  const sendBtn = document.querySelector('#notif-form button.btn-primary');
+  const originalText = sendBtn.textContent;
+  sendBtn.textContent = '发送中…';
+  sendBtn.disabled = true;
+  sendBtn.style.opacity = '0.6';
+  sendBtn.style.cursor = 'not-allowed';
+
+  try {
+    const r = await fetch(`${API}/api/teacher/notifications`, {
+      method: 'POST',
+      headers: {'Authorization': `Bearer ${TOKEN}`, 'Content-Type': 'application/json'},
+      body: JSON.stringify({ title, content, category })
+    });
+    const d = await r.json();
+    if (!r.ok) {
+      if (r.status === 409) {
+        showMsg('notif-msg', d.detail || '请勿重复提交相同通知', 'error');
+      } else {
+        showMsg('notif-msg', d.detail || '发送失败', 'error');
+      }
+      return;
+    }
+    showMsg('notif-msg', `✅ 通知已发送，覆盖 ${d.sent_count} 名学生`);
+    document.getElementById('notif-title').value = '';
+    document.getElementById('notif-content').value = '';
+    loadNotificationList();
+  } catch(e) {
+    showMsg('notif-msg', '网络错误：' + e, 'error');
+  } finally {
+    // 恢复按钮状态
+    isSendingNotification = false;
+    sendBtn.textContent = originalText;
+    sendBtn.disabled = false;
+    sendBtn.style.opacity = '1';
+    sendBtn.style.cursor = 'pointer';
+  }
+}
+
+let tnotifCurrentCat = 'all';
+let tnotifAllItems = [];
+
+async function loadNotificationList() {
+  try {
+    const r = await fetch(`${API}/api/teacher/notifications?page_size=50`, {
+      headers: {'Authorization': `Bearer ${TOKEN}`}
+    });
+    const d = await r.json();
+    tnotifAllItems = d.items || [];
+    tnotifCurrentCat = 'all';
+    // 重置标签
+    document.querySelectorAll('#tnotif-tabs .notif-tab').forEach(t => {
+      t.classList.toggle('active', t.dataset.cat === 'all');
+    });
+    renderTeacherNotifList();
+  } catch(e) { document.getElementById('notif-list').innerHTML = '<p style="color:#c62828">加载失败</p>'; }
+}
+
+function renderTeacherNotifList() {
+  const items = tnotifCurrentCat === 'all'
+    ? tnotifAllItems
+    : tnotifAllItems.filter(n => n.category === tnotifCurrentCat);
+
+  if (!items.length) {
+    document.getElementById('notif-list').innerHTML = '<p style="color:#888;font-size:.9rem">暂无已发送的通知</p>';
+    return;
+  }
+  const html = items.map(n => {
+    const readPct = n.total_students > 0
+      ? Math.round((n.read_count / n.total_students) * 100)
+      : 0;
+    return `
+    <div class="notif-item" id="tnotif-${n.id}">
+      <div class="notif-summary" onclick="toggleTeacherNotif(${n.id})">
+        <div class="notif-info">
+          <div class="notif-title">${escHtml(n.title)}</div>
+          <div class="notif-meta">
+            <span class="notif-category notif-cat-${n.category}">${CATEGORY_LABELS[n.category] || n.category}</span>
+            · 共 <strong>${n.total_students}</strong> 人
+            · 已读 <strong>${n.read_count || 0}</strong> 人（${readPct}%）
+            · ${n.created_at}
+          </div>
+        </div>
+        <span class="notif-arrow">▼</span>
+      </div>
+      <div class="notif-detail">
+        <div class="notif-body">${escHtml(n.body || '')}</div>
+        <div class="notif-actions">
+          <button class="btn btn-primary btn-sm" onclick="event.stopPropagation();editAndResend(${n.id}, '${escHtml(n.title).replace(/'/g, "\\'")}', '${escHtml(n.body || '').replace(/'/g, "\\'").replace(/\n/g, '\\n')}', '${n.category}')">✏️ 修改重发</button>
+          <button class="btn btn-outline-danger btn-sm" onclick="event.stopPropagation();deleteNotification(${n.id})">🗑 删除</button>
+        </div>
+      </div>
+    </div>
+  `;
+  }).join('');
+  document.getElementById('notif-list').innerHTML = html;
+}
+
+function switchTeacherNotifCat(cat) {
+  tnotifCurrentCat = cat;
+  document.querySelectorAll('#tnotif-tabs .notif-tab').forEach(t => {
+    t.classList.toggle('active', t.dataset.cat === cat);
+  });
+  renderTeacherNotifList();
+}
+
+function toggleTeacherNotif(nid) {
+  const el = document.getElementById('tnotif-' + nid);
+  if (!el) return;
+  el.classList.toggle('expanded');
+}
+
+async function deleteNotification(nid) {
+  showConfirmDialog(
+    '删除通知',
+    '确认删除该通知？所有学生收到的该通知将被一并移除。',
+    async () => {
+      const r = await fetch(`${API}/api/teacher/notifications/${nid}`, {
+        method: 'DELETE',
+        headers: {'Authorization': `Bearer ${TOKEN}`}
+      });
+      const d = await r.json();
+      if (!r.ok) { showMsg('notif-msg', d.detail || '删除失败', 'error'); return; }
+      showMsg('notif-msg', `✅ 已删除 ${d.deleted_count || 0} 条通知`);
+      loadNotificationList();
+    }
+  );
+}
+
+function editAndResend(nid, title, body, category) {
+  // 创建编辑弹窗
+  const backdrop = document.createElement('div');
+  backdrop.className = 'confirm-dialog-backdrop';
+  backdrop.innerHTML = `
+    <div class="confirm-dialog" style="max-width:520px;text-align:left;">
+      <h3 style="text-align:center;">✏️ 修改并重发通知</h3>
+      <div style="margin-bottom:10px;">
+        <label class="form-label">标题</label>
+        <input type="text" id="edit-title" value="${title}" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:6px;font-size:.95rem;">
+      </div>
+      <div style="margin-bottom:10px;">
+        <label class="form-label">分类</label>
+        <select id="edit-category" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:6px;font-size:.95rem;">
+          <option value="announcement" ${category==='announcement'?'selected':''}>📋 公告</option>
+          <option value="deadline" ${category==='deadline'?'selected':''}>⏰ 截止提醒</option>
+          <option value="grade" ${category==='grade'?'selected':''}>📊 成绩通知</option>
+        </select>
+      </div>
+      <div style="margin-bottom:16px;">
+        <label class="form-label">通知内容</label>
+        <textarea id="edit-content" rows="5" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:6px;font-size:.95rem;resize:vertical;">${body}</textarea>
+      </div>
+      <p style="font-size:.8rem;color:#888;margin-bottom:16px;">修改后将重新发送给所有学生（先删除旧通知，再发送新通知）</p>
+      <div class="btn-row">
+        <button class="btn btn-outline btn-sm" id="edit-cancel">取消</button>
+        <button class="btn btn-primary btn-sm" id="edit-confirm">确认重发</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(backdrop);
+
+  let isResending = false;
+
+  backdrop.querySelector('#edit-cancel').onclick = () => backdrop.remove();
+  backdrop.querySelector('#edit-confirm').onclick = async () => {
+    if (isResending) return;
+    const newTitle = backdrop.querySelector('#edit-title').value.trim();
+    const newContent = backdrop.querySelector('#edit-content').value.trim();
+    const newCategory = backdrop.querySelector('#edit-category').value;
+    if (!newTitle) { alert('请输入标题'); return; }
+    if (!newContent) { alert('请输入内容'); return; }
+    if (newTitle.length > 200) { alert('标题不能超过 200 个字符'); return; }
+
+    isResending = true;
+    const confirmBtn = backdrop.querySelector('#edit-confirm');
+    confirmBtn.textContent = '处理中…';
+    confirmBtn.disabled = true;
+    confirmBtn.style.opacity = '0.6';
+
+    try {
+      // 先删除旧通知（按 title+category 批量删除）
+      await fetch(`${API}/api/teacher/notifications/${nid}`, {
+        method: 'DELETE',
+        headers: {'Authorization': `Bearer ${TOKEN}`}
+      });
+      // 再发送新通知
+      const r = await fetch(`${API}/api/teacher/notifications`, {
+        method: 'POST',
+        headers: {'Authorization': `Bearer ${TOKEN}`, 'Content-Type': 'application/json'},
+        body: JSON.stringify({ title: newTitle, content: newContent, category: newCategory })
+      });
+      const d = await r.json();
+      if (!r.ok) {
+        if (r.status === 409) {
+          showMsg('notif-msg', d.detail || '请勿重复提交', 'error');
+        } else {
+          showMsg('notif-msg', d.detail || '发送失败', 'error');
+        }
+        return;
+      }
+      showMsg('notif-msg', `✅ 通知已修改并重发，覆盖 ${d.sent_count} 名学生`);
+      backdrop.remove();
+      loadNotificationList();
+    } catch(e) {
+      showMsg('notif-msg', '网络错误：' + e, 'error');
+    } finally {
+      isResending = false;
+    }
+  };
+  // 点击遮罩关闭
+  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) backdrop.remove(); });
+}
+
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s || '';
+  return d.innerHTML;
+}
+
 // ───── GitHub 绑定状态看板 (F-T-004) ─────
 
 let allBindings = [];
@@ -810,12 +1128,21 @@ if (TOKEN) {
         document.getElementById('app').style.display = 'block';
         loadExams();
         loadStudentList();
+        loadNotificationList();
         loadBindingDashboard();
       } else {
         TOKEN = ''; sessionStorage.removeItem('teacher_token');
       }
     }).catch(() => {});
 }
+
+// Ctrl+Enter 快捷发送通知
+document.addEventListener('keydown', function(e) {
+  if (e.ctrlKey && e.key === 'Enter' && document.activeElement.id === 'notif-content') {
+    e.preventDefault();
+    sendNotification();
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  进度看板功能（后端API版本）
@@ -847,15 +1174,6 @@ async function fetchProgressData() {
     pbData = await resp.json();
     renderPBHeatmap(pbData);
     renderPBBarChart(pbData);
-    
-    // 更新图例下的提示文字
-    const legendDiv = document.querySelector('#progress-board-body .card-body div:nth-child(1)');
-    if (legendDiv) {
-      const statSpan = legendDiv.querySelector('span:last-child');
-      if (statSpan) {
-        statSpan.textContent = `（点击单元格查看提交详情 · ${pbData.students?.length || 0} 名学生 · ${pbData.exams?.filter(e => e.is_active)?.length || 0} 个任务）`;
-      }
-    }
     
   } catch (e) {
     console.error('获取进度数据失败:', e);

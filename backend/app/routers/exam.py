@@ -6,15 +6,30 @@ from app.auth_utils import verify_student_token
 
 router = APIRouter()
 
+# 远程数据库常量
+COURSE_ID = 2       # 嵌入式系统综合实践
+TEACHER_ID = 14     # 教师 李明
+
 
 class SubmitRequest(BaseModel):
     score: float
     total: float
 
 
+def _get_user_id(conn, student_no: str) -> Optional[int]:
+    """通过 student_no 获取 user_id"""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id FROM users WHERE role = 'student' AND student_no = %s",
+        (student_no,)
+    )
+    row = cur.fetchone()
+    return row["id"] if row else None
+
+
 @router.post("/api/exam/submit")
 def submit_score(req: SubmitRequest, authorization: Optional[str] = Header(None)):
-    """提交成绩，需要学生 JWT。每人每考试只能提交一次。"""
+    """提交成绩"""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="未登录")
     token = authorization.removeprefix("Bearer ").strip()
@@ -50,7 +65,7 @@ def submit_score(req: SubmitRequest, authorization: Optional[str] = Header(None)
 
 @router.get("/api/scores")
 def get_scores(student_id: str = Query(...)):
-    """查询某学生所有考试成绩（公开接口，凭学号查询）"""
+    """查询某学生所有考试成绩"""
     with db() as conn:
         student = conn.execute(
             "SELECT name, student_id, class_name FROM students WHERE student_id = %s",
@@ -70,16 +85,18 @@ def get_scores(student_id: str = Query(...)):
 
     result = []
     for exam in exams:
-        s = scores_map.get(exam["id"])
+        eid = str(exam["id"])
+        s = scores_map.get(eid)
         result.append({
-            "exam_id": exam["id"],
+            "exam_id": eid,
             "exam_title": exam["title"],
-            "score": s["score"] if s else None,
-            "total": s["total"] if s else None,
-            "submitted_at": s["submitted_at"] if s else None,
+            "exam_type": exam.get("exam_type", ""),
+            "score": float(s["score"]) if s else None,
+            "total": float(s["total"]) if s else None,
+            "submitted_at": s["submitted_at"].strftime("%Y-%m-%d %H:%M:%S") if s and s["submitted_at"] else None,
         })
 
     return {
-        "student": dict(student),
+        "student": {"name": student["name"], "student_id": student["student_id"], "class_name": student["class_name"]},
         "scores": result,
     }

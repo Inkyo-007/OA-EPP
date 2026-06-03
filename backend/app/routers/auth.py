@@ -15,9 +15,7 @@ class VerifyRequest(BaseModel):
 def verify_identity(req: VerifyRequest):
     """
     核验学生身份并检查是否已提交成绩。
-    - 学号不存在 → 403
-    - 已提交 → {already_submitted: true, score, total, submitted_at}
-    - 未提交 → {already_submitted: false, token}
+    适配远程 users + students + exams 表。
     """
     with db() as conn:
         student = conn.execute(
@@ -34,9 +32,11 @@ def verify_identity(req: VerifyRequest):
         ).fetchone()
 
         if not exam:
-            raise HTTPException(status_code=404, detail="考试不存在")
+            # 如果考试不存在，仍然允许验证身份（返回 token），
+            # 实际考试状态由前端根据列表接口判断
+            pass
 
-        if not exam["is_active"]:
+        if exam and not exam["is_active"]:
             raise HTTPException(status_code=403, detail="本次考试已关闭，无法答题")
 
         existing = conn.execute(
@@ -48,9 +48,9 @@ def verify_identity(req: VerifyRequest):
             return {
                 "already_submitted": True,
                 "name": student["name"],
-                "score": existing["score"],
-                "total": existing["total"],
-                "submitted_at": existing["submitted_at"],
+                "score": float(existing["score"]) if existing["score"] else 0,
+                "total": float(existing["total"]) if existing["total"] else 0,
+                "submitted_at": existing["submitted_at"].strftime("%Y-%m-%d %H:%M:%S") if existing["submitted_at"] else None,
             }
 
         token = create_token({
