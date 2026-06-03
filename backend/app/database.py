@@ -1,5 +1,6 @@
 import os
 import pymysql
+import re
 from contextlib import contextmanager
 from urllib.parse import urlparse, unquote
 from pathlib import Path
@@ -40,6 +41,14 @@ def is_docker_env():
     if os.environ.get("DOCKER_CONTAINER", "") == "true":
         return True
     return False
+
+# 兼容旧的环境变量配置方式
+MYSQL_HOST = os.environ.get("MYSQL_HOST", "").strip()
+MYSQL_PORT = int(os.environ.get("MYSQL_PORT", "3306"))
+MYSQL_USER = os.environ.get("MYSQL_USER", "root")
+MYSQL_PASSWORD = os.environ.get("MYSQL_PASSWORD", "")
+MYSQL_DATABASE = os.environ.get("MYSQL_DATABASE", "oaepp_dev")
+
 
 class _RowProxy(dict):
     """A dict that also supports index-based access like sqlite3.Row."""
@@ -140,6 +149,25 @@ def db():
         conn.close()
 
 
+def _convert_sql(sql: str) -> str:
+    """Convert SQLite SQL dialect to MySQL dialect."""
+    # Replace ? placeholders with %s
+    sql = sql.replace("?", "%s")
+    # INSERT OR REPLACE INTO → REPLACE INTO
+    sql = re.sub(r"INSERT\s+OR\s+REPLACE\s+INTO", "REPLACE INTO", sql, flags=re.IGNORECASE)
+    # ON CONFLICT(x) DO UPDATE SET → ON DUPLICATE KEY UPDATE
+    sql = re.sub(
+        r"ON\s+CONFLICT\s*\([^)]+\)\s*DO\s+UPDATE\s+SET\s*",
+        "ON DUPLICATE KEY UPDATE ",
+        sql, flags=re.IGNORECASE,
+    )
+    # excluded.col → VALUES(col)
+    sql = re.sub(r"\bexcluded\.(\w+)", r"VALUES(\1)", sql)
+    # datetime('now','localtime') → NOW()
+    sql = sql.replace("datetime('now','localtime')", "NOW()")
+    return sql
+
+
 def _migrate_chapters(conn):
     """幂等地为旧 chapters 表补充 F-S-011 字段（MySQL 版）"""
     try:
@@ -181,47 +209,74 @@ def _migrate_courses(conn):
 def init_db():
     """Create tables if they don't exist. DDL may fail on shared DB with restricted permissions — that's OK."""
     with db() as conn:
-        try:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS students (
-                    id          INT AUTO_INCREMENT PRIMARY KEY,
-                    name        VARCHAR(255) NOT NULL,
-                    student_id  VARCHAR(100) UNIQUE NOT NULL,
-                    class_name  VARCHAR(255) DEFAULT '',
-                    pinyin      VARCHAR(255) DEFAULT '',
-                    pinyin_abbr VARCHAR(255) DEFAULT '',
-                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-        except Exception as e:
-            print(f"[init_db] students table skipped: {e}")
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS students (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL,
+            student_id  TEXT UNIQUE NOT NULL,
+            class_name  TEXT DEFAULT '',
+            pinyin      TEXT DEFAULT '',
+            pinyin_abbr TEXT DEFAULT '',
+            created_at  TEXT DEFAULT (datetime('now','localtime'))
+        );
+
+        CREATE TABLE IF NOT EXISTS exams (
+            id         TEXT PRIMARY KEY,
+            title      TEXT NOT NULL,
+            is_active  INTEGER DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS scores (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id   TEXT NOT NULL,
+            exam_id      TEXT NOT NULL,
+            score        REAL NOT NULL,
+            total        REAL NOT NULL,
+            submitted_at TEXT DEFAULT (datetime('now','localtime')),
+            UNIQUE(student_id, exam_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS student_accounts (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id     TEXT UNIQUE NOT NULL,
+            email          TEXT DEFAULT '',
+            password_hash  TEXT NOT NULL DEFAULT '',
+            failed_attempts INTEGER DEFAULT 0,
+            locked_until   TEXT DEFAULT '',
+            created_at     TEXT DEFAULT (datetime('now','localtime')),
+            FOREIGN KEY(student_id) REFERENCES students(student_id) ON DELETE CASCADE
+        );
+        """)
 
         try:
             conn.execute("""
-                CREATE TABLE IF NOT EXISTS exams (
-                    id         VARCHAR(100) PRIMARY KEY,
-                    title      VARCHAR(255) NOT NULL,
-                    is_active  TINYINT DEFAULT 1
+                CREATE TABLE IF NOT EXISTS classroom_exam_attempts (
+                    id                  INT AUTO_INCREMENT PRIMARY KEY,
+                    exam_id             VARCHAR(100) NOT NULL,
+                    student_id          VARCHAR(100) NOT NULL,
+                    status              VARCHAR(20) NOT NULL DEFAULT 'draft',
+                    objective_score     DOUBLE,
+                    subjective_pending  TINYINT DEFAULT 0,
+                    total_score         DOUBLE,
+                    max_score           DOUBLE,
+                    submitted_at        DATETIME,
+                    auto_submitted      TINYINT DEFAULT 0,
+                    draft_saved_at      DATETIME,
+                    answers_json        TEXT,
+                    UNIQUE(exam_id, student_id),
+                    FOREIGN KEY (exam_id) REFERENCES classroom_exams(id)
                 )
             """)
         except Exception as e:
-            print(f"[init_db] exams table skipped: {e}")
+            print(f"[init_db] classroom_exam_attempts table skipped: {e}")
 
+        # 尝试添加可选字段（兼容旧数据）
         try:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS scores (
-                    id           INT AUTO_INCREMENT PRIMARY KEY,
-                    student_id   VARCHAR(100) NOT NULL,
-                    exam_id      VARCHAR(100) NOT NULL,
-                    score        DOUBLE NOT NULL,
-                    total        DOUBLE NOT NULL,
-                    submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(student_id, exam_id)
-                )
-            """)
-        except Exception as e:
-            print(f"[init_db] scores table skipped: {e}")
+            conn.execute("ALTER TABLE classroom_exam_attempts ADD COLUMN question_scores_json TEXT")
+        except Exception:
+            pass
 
+        # 继续创建 upstream/main 的表结构
         try:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS courses (
@@ -287,6 +342,94 @@ def init_db():
         except Exception as e:
             print(f"[init_db] github_bindings table skipped: {e}")
 
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS teacher_comments (
+                    id          INT AUTO_INCREMENT PRIMARY KEY,
+                    student_id  VARCHAR(100) NOT NULL,
+                    comment     TEXT NOT NULL,
+                    teacher     VARCHAR(100) DEFAULT 'teacher',
+                    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY uq_comments_student (student_id)
+                )
+            """)
+        except Exception as e:
+            print(f"[init_db] teacher_comments table skipped: {e}")
+
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS student_github_info (
+                    id              INT AUTO_INCREMENT PRIMARY KEY,
+                    student_id      VARCHAR(100) UNIQUE NOT NULL,
+                    github_username VARCHAR(255) DEFAULT '',
+                    repo_name       VARCHAR(255) DEFAULT '',
+                    github_token    VARCHAR(500) DEFAULT '',
+                    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                )
+            """)
+        except Exception as e:
+            print(f"[init_db] student_github_info table skipped: {e}")
+
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS audit_logs (
+                    id           INT AUTO_INCREMENT PRIMARY KEY,
+                    action       VARCHAR(100) NOT NULL,
+                    operator     VARCHAR(100) DEFAULT 'teacher',
+                    target_type  VARCHAR(50) NOT NULL,
+                    target_id    VARCHAR(200),
+                    format       VARCHAR(50),
+                    ip_address   VARCHAR(50),
+                    user_agent   VARCHAR(500),
+                    details      TEXT,
+                    created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+        except Exception as e:
+            print(f"[init_db] audit_logs table skipped: {e}")
+
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS course_settings (
+                    id          INT AUTO_INCREMENT PRIMARY KEY,
+                    `key`       VARCHAR(100) UNIQUE NOT NULL,
+                    value       TEXT NOT NULL,
+                    updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                )
+            """)
+        except Exception as e:
+            print(f"[init_db] course_settings table skipped: {e}")
+
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS attendance (
+                    id           INT AUTO_INCREMENT PRIMARY KEY,
+                    student_id   VARCHAR(100) NOT NULL,
+                    date         VARCHAR(20) NOT NULL,
+                    status       VARCHAR(20) NOT NULL,
+                    note         VARCHAR(500) DEFAULT '',
+                    created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY uq_attendance_student_date (student_id, date)
+                )
+            """)
+        except Exception as e:
+            print(f"[init_db] attendance table skipped: {e}")
+
+        # Create indexes (ignore duplicate / permission errors)
+        for idx_sql in [
+            "CREATE INDEX idx_scores_student ON scores(student_id)",
+            "CREATE INDEX idx_scores_exam ON scores(exam_id)",
+            "CREATE INDEX idx_attendance_student ON attendance(student_id)",
+            "CREATE INDEX idx_audit_logs_created ON audit_logs(created_at)",
+            "CREATE INDEX idx_audit_logs_target ON audit_logs(target_type, target_id)",
+        ]:
+            try:
+                conn.execute(idx_sql)
+            except Exception:
+                pass
+
         _migrate_chapters(conn)
         _migrate_courses(conn)
 
@@ -298,9 +441,27 @@ def init_db():
         except Exception:
             pass
 
+    # Insert default settings
+    try:
+        with db() as conn:
+            existing = {r["key"] for r in conn.execute("SELECT `key` FROM course_settings").fetchall()}
+            defaults = [
+                ("course_name", "研究生课程《机器人系统》"),
+                ("semester", "2024-2025学年第一学期"),
+                ("github_token", ""),
+            ]
+            for key, value in defaults:
+                if key not in existing:
+                    conn.execute(
+                        "INSERT INTO course_settings (`key`, value) VALUES (%s, %s)",
+                        (key, value),
+                    )
+    except Exception:
+        pass
+
 
 def seed_timeline_events():
-    """如果 timeline_events 为空，插入演示数据。无权限或表不存在时跳过。"""
+    """If timeline_events is empty, insert demo data. Skip if no permission or table missing."""
     try:
         with db() as conn:
             count = conn.execute("SELECT COUNT(*) FROM timeline_events").fetchone()[0]

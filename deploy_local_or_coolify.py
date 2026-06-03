@@ -236,25 +236,43 @@ def start_api_server():
         str(REPO_ROOT),
     ]
 
-    cmd = [
-        sys.executable,
-        "-m",
-        "uvicorn",
-        "app.main:app",
-        "--host",
-        HOST,
-        "--port",
-        str(API_PORT),
-        "--reload",
-    ]
+    if os.name == "nt":
+        # On Windows, Click expands glob patterns in sys.argv by default.
+        # Programmatically pass args to uvicorn.main.main() instead.
+        uvicorn_args = [
+            "app.main:app",
+            "--host",
+            HOST,
+            "--port",
+            str(API_PORT),
+            "--reload",
+        ]
+        for d in reload_dirs:
+            uvicorn_args += ["--reload-dir", d]
+        for pat in ("*.py", "*.html", "*.md", "*.css", "*.js"):
+            uvicorn_args += ["--reload-include", pat]
 
-    # Add --reload-dir entries
-    for d in reload_dirs:
-        cmd += ["--reload-dir", d]
-
-    # Also watch common non-.py assets (md, html, css, js)
-    for pat in ("*.py", "*.html", "*.md", "*.css", "*.js"):
-        cmd += ["--reload-include", pat]
+        cmd = [
+            sys.executable,
+            "-c",
+            "import uvicorn; uvicorn.main.main(%r)" % uvicorn_args,
+        ]
+    else:
+        cmd = [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "app.main:app",
+            "--host",
+            HOST,
+            "--port",
+            str(API_PORT),
+            "--reload",
+        ]
+        for d in reload_dirs:
+            cmd += ["--reload-dir", d]
+        for pat in ("*.py", "*.html", "*.md", "*.css", "*.js"):
+            cmd += ["--reload-include", pat]
 
     popen_kwargs = dict(cwd=str(BACKEND_DIR), env=env)
     # On POSIX, start a new process group so we can terminate whole group later
@@ -276,6 +294,8 @@ def serve_local():
     teacher_pwd = os.environ.get("TEACHER_PASSWORD", "admin123")
     print(f"🎓 教师后台：  http://{HOST}:{API_PORT}/teacher  （密码：{teacher_pwd}）")
     print(f"📊 学生查分：  http://{HOST}:{API_PORT}/score")
+    print(f"✏️  课堂考试：  http://{HOST}:{API_PORT}/classroom-exam  （勿用 /api/classroom-exam）")
+    print(f"📝 考试管理：  http://{HOST}:{API_PORT}/classroom-exam/admin")
     print(f"📡 API 文档：  http://{HOST}:{API_PORT}/api/docs")
     print("⛔ Ctrl+C 停止所有服务\n")
 

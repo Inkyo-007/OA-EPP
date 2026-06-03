@@ -68,8 +68,17 @@ def submit_score(req: SubmitRequest, authorization: Optional[str] = Header(None)
 
 
 @router.get("/api/scores")
-def get_scores(student_id: str = Query(...)):
-    """查询某学生所有考试成绩"""
+def get_scores(authorization: Optional[str] = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="未登录")
+
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        payload = verify_student_token(token)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+    student_id = payload["student_id"]
     with db() as conn:
         cursor = conn.cursor()
         

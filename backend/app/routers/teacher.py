@@ -9,7 +9,7 @@ from fastapi.responses import StreamingResponse
 from typing import Optional, List
 from pydantic import BaseModel
 from app.database import db
-from app.auth_utils import create_token, verify_teacher_token
+from app.auth_utils import create_token, hash_password, verify_teacher_token, require_teacher
 from app.sync_exams import sync_exams
 from pypinyin import lazy_pinyin, Style
 import openpyxl
@@ -21,6 +21,7 @@ load_dotenv()
 router = APIRouter()
 
 TEACHER_PASSWORD = os.environ.get("TEACHER_PASSWORD", "admin123")
+COURSE_ID = int(os.environ.get("COURSE_ID", "1"))
 
 
 def _require_teacher(authorization: Optional[str]):
@@ -39,6 +40,29 @@ def _name_to_pinyin(name: str):
     return full.lower(), abbr.lower()
 
 
+def _list_students_with_class(conn):
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT u.full_name AS name, u.student_no AS student_id,
+               u.id AS user_id, COALESCE(s.class_name, '') AS class_name
+        FROM users u
+        JOIN students s ON s.user_id = u.id
+        JOIN enrollments e ON e.student_user_id = u.id
+        WHERE u.role = 'student' AND e.course_id = %s
+        ORDER BY u.student_no
+    """, (COURSE_ID,))
+    return cur.fetchall()
+
+
+def _get_enrolled_student_count(conn):
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COUNT(*) AS cnt FROM enrollments WHERE course_id = %s",
+        (COURSE_ID,)
+    )
+    return cur.fetchone()["cnt"]
+
+
 class LoginRequest(BaseModel):
     password: str
 
@@ -47,31 +71,97 @@ class LoginRequest(BaseModel):
 def teacher_login(req: LoginRequest):
     if req.password != TEACHER_PASSWORD:
         raise HTTPException(status_code=401, detail="密码错误")
-    token = create_token({"role": "teacher"}, expires_hours=8)
+    token = create_token({"role": "teacher", "name": "teacher"})
     return {"token": token}
 
 
 @router.get("/api/teacher/exams")
 def list_exams(authorization: Optional[str] = Header(None)):
-    _require_teacher(authorization)
-    
+    require_teacher(authorization)
     with db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, title FROM exams ORDER BY id")
-        exams = cursor.fetchall()
-        
-        # 转换为原来的格式
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, title, exam_type, start_at, end_at, is_active
+            FROM exams WHERE course_id = %s ORDER BY id
+        """, (COURSE_ID,))
+        exams = cur.fetchall()
+
+    if not exams:
+        print("[list_exams] 考试表为空，触发懒加载同步…")
+        sync_exams()
+        with db() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id, title, exam_type, start_at, end_at, is_active
+                FROM exams WHERE course_id = %s ORDER BY id
+            """, (COURSE_ID,))
+            exams = cur.fetchall()
+
+    with db() as conn:
+        cur = conn.cursor()
+        total_students = _get_enrolled_student_count(conn)
         result = []
-        for exam in exams:
+        for e in exams:
+            submitted = 0
+            avg = None
+            try:
+                cur.execute("""
+                    SELECT COUNT(DISTINCT sub.student_user_id) AS cnt
+                    FROM grading_records gr
+                    JOIN submissions sub ON gr.submission_id = sub.id
+                    JOIN assignments a ON sub.assignment_id = a.id
+                    WHERE a.course_id = %s AND a.title LIKE CONCAT('exam_', %s, '%%')
+                """, (COURSE_ID, str(e["id"])))
+                submitted = cur.fetchone()["cnt"] or 0
+
+                cur.execute("""
+                    SELECT AVG(gr.exam_score) AS avg
+                    FROM grading_records gr
+                    JOIN submissions sub ON gr.submission_id = sub.id
+                    JOIN assignments a ON sub.assignment_id = a.id
+                    WHERE a.course_id = %s AND a.title LIKE CONCAT('exam_', %s, '%%')
+                """, (COURSE_ID, str(e["id"])))
+                avg_row = cur.fetchone()
+                avg = avg_row["avg"]
+            except Exception:
+                try:
+                    cur.execute("SELECT COUNT(*) AS cnt FROM scores WHERE exam_id = %s", (e["id"],))
+                    submitted = cur.fetchone()["cnt"] or 0
+                except Exception:
+                    submitted = 0
+                try:
+                    cur.execute("SELECT AVG(score) AS avg FROM scores WHERE exam_id = %s", (e["id"],))
+                    avg_row = cur.fetchone()
+                    avg = avg_row["avg"]
+                except Exception:
+                    avg = None
+
+            status = None
+            try:
+                cur.execute("SELECT start_at, end_at FROM classroom_exams WHERE id = %s", (e["id"],))
+                ce = cur.fetchone()
+                if ce and ce.get("start_at") and ce.get("end_at"):
+                    try:
+                        now = datetime.now()
+                        start = datetime.strptime(str(ce["start_at"]), "%Y-%m-%d %H:%M:%S")
+                        end = datetime.strptime(str(ce["end_at"]), "%Y-%m-%d %H:%M:%S")
+                        status = "active" if (now >= start and now <= end) else "ended"
+                    except Exception:
+                        status = "unknown"
+                else:
+                    status = "active" if e.get("is_active", 1) == 1 else "ended"
+            except Exception:
+                status = "active" if e.get("is_active", 1) == 1 else "ended"
+
             result.append({
-                "id": str(exam["id"]),
-                "title": exam["title"],
-                "is_active": 1,  # 默认都激活
-                "submitted": 0,
-                "total_students": 0,
-                "avg_score": None
+                "id": str(e["id"]), "title": e["title"], "is_active": 1,
+                "exam_type": e["exam_type"],
+                "start_at": e["start_at"].strftime("%Y-%m-%d %H:%M:%S") if e["start_at"] else None,
+                "end_at": e["end_at"].strftime("%Y-%m-%d %H:%M:%S") if e["end_at"] else None,
+                "submitted": submitted, "total_students": total_students,
+                "avg_score": round(float(avg), 1) if avg else None,
+                "status": status,
             })
-    
     return result
 
 
@@ -81,17 +171,9 @@ def list_students(authorization: Optional[str] = Header(None)):
     _require_teacher(authorization)
     
     with db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT u.full_name as name, u.student_no as student_id, s.class_name 
-            FROM users u 
-            JOIN students s ON u.id = s.user_id 
-            WHERE u.role = 'student'
-            ORDER BY s.class_name, u.full_name
-        """)
-        rows = cursor.fetchall()
+        rows = _list_students_with_class(conn)
     
-    return [dict(row) for row in rows]
+    return [{"name": r["name"], "student_id": r["student_id"], "class_name": r["class_name"]} for r in rows]
 
 
 class AddStudentRequest(BaseModel):
@@ -111,48 +193,36 @@ def add_student(req: AddStudentRequest, authorization: Optional[str] = Header(No
         raise HTTPException(status_code=422, detail="姓名和学号不能为空")
     
     with db() as conn:
-        cursor = conn.cursor()
-        
-        # 查找默认教师
-        cursor.execute("SELECT user_id FROM teachers LIMIT 1")
-        teacher = cursor.fetchone()
-        if not teacher:
-            raise HTTPException(status_code=500, detail="没有找到教师用户")
-        
-        teacher_id = teacher["user_id"]
-        
-        # 查找默认课程
-        cursor.execute("SELECT id FROM courses LIMIT 1")
-        course = cursor.fetchone()
-        course_id = course["id"] if course else None
-        
-        # 检查学生是否已存在
-        cursor.execute("SELECT id FROM users WHERE student_no = %s", (req.student_id,))
-        existing = cursor.fetchone()
-        
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT u.full_name FROM users u WHERE u.student_no = %s",
+            (req.student_id,)
+        )
+        existing = cur.fetchone()
         if existing:
-            raise HTTPException(status_code=409, detail=f"学号 {req.student_id} 已存在")
-        
-        # 创建用户 - 密码就用学号
-        cursor.execute("""
-            INSERT INTO users (role, student_no, email, password_hash, full_name)
-            VALUES (%s, %s, %s, %s, %s)
-        """, ('student', req.student_id, f"{req.student_id}@example.com", req.student_id, req.name))
-        user_id = cursor.lastrowid
-        
-        # 创建学生记录
-        cursor.execute("""
-            INSERT INTO students (user_id, class_name)
-            VALUES (%s, %s)
-        """, (user_id, req.class_name or "默认班级"))
-        
-        # 同时创建一个课程注册记录
-        if course_id:
-            cursor.execute("""
-                INSERT INTO enrollments (course_id, student_user_id)
-                VALUES (%s, %s)
-            """, (course_id, user_id))
-    
+            raise HTTPException(status_code=409,
+                                detail=f"学号 {req.student_id} 已存在（{existing['full_name']}）")
+
+        email = f"{req.student_id}@stu.oaepp.dev"
+        cur.execute(
+            "INSERT INTO users (role, student_no, email, password_hash, full_name) VALUES ('student', %s, %s, '', %s)",
+            (req.student_id, email, req.name)
+        )
+        user_id = cur.lastrowid
+
+        cur.execute(
+            "INSERT INTO students (user_id, class_name) VALUES (%s, %s)",
+            (user_id, req.class_name.strip())
+        )
+        cur.execute(
+            "INSERT IGNORE INTO enrollments (course_id, student_user_id) VALUES (%s, %s)",
+            (COURSE_ID, user_id)
+        )
+        cur.execute(
+            "INSERT INTO student_accounts (student_id, password_hash) VALUES (%s, %s)",
+            (req.student_id, hash_password(req.student_id)),
+        )
+
     return {"ok": True}
 
 
@@ -164,23 +234,19 @@ def delete_student(student_id: str, authorization: Optional[str] = Header(None))
     with db() as conn:
         cursor = conn.cursor()
         
-        # 查找学生
-        cursor.execute("SELECT id FROM users WHERE student_no = %s", (student_id,))
+        cursor.execute("SELECT id, full_name FROM users WHERE student_no = %s", (student_id,))
         user = cursor.fetchone()
         
         if not user:
             raise HTTPException(status_code=404, detail="学号不存在")
-        
+
         user_id = user["id"]
         
-        # 删除关联记录 - 先删除注册记录
         cursor.execute("DELETE FROM enrollments WHERE student_user_id = %s", (user_id,))
-        # 然后删除学生记录
         cursor.execute("DELETE FROM students WHERE user_id = %s", (user_id,))
-        # 最后删除用户
         cursor.execute("DELETE FROM users WHERE id = %s", (user_id,))
     
-    return {"ok": True}
+    return {"ok": True, "deleted": user["full_name"]}
 
 
 @router.delete("/api/teacher/students")
@@ -191,11 +257,9 @@ def clear_all_students(authorization: Optional[str] = Header(None)):
     with db() as conn:
         cursor = conn.cursor()
         
-        # 获取学生数量
         cursor.execute("SELECT COUNT(*) as cnt FROM users WHERE role = 'student'")
         count = cursor.fetchone()["cnt"]
         
-        # 删除关联记录
         cursor.execute("""
             DELETE e FROM enrollments e
             JOIN users u ON e.student_user_id = u.id
@@ -216,15 +280,13 @@ async def upload_students(
     """上传学生名单 CSV（支持增量/全量覆盖模式，UTF-8/GBK编码）"""
     _require_teacher(authorization)
     
-    batch_id = str(uuid.uuid4())[:8]  # 短批次号
+    batch_id = str(uuid.uuid4())[:8]
     operator = "teacher"
     
-    # 读取文件
     content = await file.read()
     detected = chardet.detect(content)
     encoding = detected.get("encoding", "utf-8") or "utf-8"
     
-    # 尝试解码
     try:
         text = content.decode(encoding)
     except UnicodeDecodeError:
@@ -233,15 +295,13 @@ async def upload_students(
         except UnicodeDecodeError:
             text = content.decode("utf-8", errors="replace")
     
-    # 解析 CSV
     lines = text.splitlines()
     reader = csv.DictReader(lines)
     
-    # 清理表头（去除BOM和空格）
-    reader.fieldnames = [f.strip().lstrip("\ufeff") for f in reader.fieldnames] if reader.fieldnames else []
+    if reader.fieldnames:
+        reader.fieldnames = [f.strip().lstrip("\ufeff") for f in reader.fieldnames]
     fields = reader.fieldnames or []
     
-    # 校验字段
     if "学号" not in fields or "姓名" not in fields:
         raise HTTPException(status_code=422, detail="CSV 格式错误：缺少必要字段「学号」或「姓名」")
     
@@ -251,7 +311,6 @@ async def upload_students(
     with db() as conn:
         cursor = conn.cursor()
         
-        # 获取现有学生
         cursor.execute("""
             SELECT u.student_no, u.id FROM users u
             WHERE u.role = 'student'
@@ -260,7 +319,6 @@ async def upload_students(
             existing_student_ids.add(row["student_no"])
             existing_student_users[row["student_no"]] = row["id"]
         
-        # 查找默认教师
         cursor.execute("SELECT user_id FROM teachers LIMIT 1")
         teacher = cursor.fetchone()
         if not teacher:
@@ -268,12 +326,10 @@ async def upload_students(
         
         teacher_id = teacher["user_id"]
         
-        # 查找默认课程
         cursor.execute("SELECT id FROM courses LIMIT 1")
         course = cursor.fetchone()
         course_id = course["id"] if course else None
         
-        # 如果是全量模式，先清空（保留原有主键，清空内容）
         if import_mode == "full":
             cursor.execute("""
                 DELETE e FROM enrollments e
@@ -285,33 +341,28 @@ async def upload_students(
             existing_student_ids = set()
             existing_student_users = {}
         
-        # 解析和校验每行数据
         rows = []
         errors = []
         student_ids_in_file = set()
         seen_student_ids = set()
         
         for idx, row in enumerate(reader, start=2):
-            # 获取字段
             student_id = str(row.get("学号", "")).strip()
             name = str(row.get("姓名", "")).strip()
             class_name = str(row.get("班级", "")).strip()
             course_name = str(row.get("课程", "")).strip()
             
-            # 完整性校验
             row_errors = []
             if not student_id:
                 row_errors.append("学号不能为空")
             if not name:
                 row_errors.append("姓名不能为空")
             
-            # 唯一性校验
             if student_id and student_id in seen_student_ids:
                 row_errors.append(f"学号 {student_id} 在文件中重复")
             if student_id and student_id in existing_student_ids and import_mode == "incremental":
                 row_errors.append(f"学号 {student_id} 已存在于系统中")
             
-            # 收集有效行
             if not row_errors:
                 seen_student_ids.add(student_id)
                 student_ids_in_file.add(student_id)
@@ -329,32 +380,34 @@ async def upload_students(
                     "errors": row_errors
                 })
         
-        # 执行导入
         success_count = 0
         created_user_ids = []
         
         for row in rows:
             try:
-                # 创建用户
+                email = f"{row['student_id']}@stu.oaepp.dev"
                 cursor.execute("""
                     INSERT INTO users (role, student_no, email, password_hash, full_name)
-                    VALUES (%s, %s, %s, %s, %s)
-                """, ('student', row["student_id"], f"{row['student_id']}@example.com", row["student_id"], row["name"]))
+                    VALUES ('student', %s, %s, '', %s)
+                """, (row["student_id"], email, row["name"]))
                 user_id = cursor.lastrowid
                 created_user_ids.append(user_id)
                 
-                # 创建学生记录
                 cursor.execute("""
                     INSERT INTO students (user_id, class_name)
                     VALUES (%s, %s)
                 """, (user_id, row["class_name"] or "默认班级"))
                 
-                # 同时创建一个课程注册记录
                 if course_id:
                     cursor.execute("""
                         INSERT INTO enrollments (course_id, student_user_id)
                         VALUES (%s, %s)
                     """, (course_id, user_id))
+                
+                cursor.execute("""
+                    INSERT INTO student_accounts (student_id, password_hash)
+                    VALUES (%s, %s)
+                """, (row["student_id"], hash_password(row["student_id"])))
                 
                 success_count += 1
             except Exception as e:
@@ -369,39 +422,28 @@ async def upload_students(
                     "errors": [str(e)]
                 })
         
-        # 记录导入日志到 notifications 表（用管理员或教师用户ID）
-        # 先获取一个可以用于通知的用户ID，用当前教师用户
-        notification_user_id = teacher_id
-        
-        # 构建导入日志消息
-        log_message = f"""
-批次号: {batch_id}
+        log_message = f"""批次号: {batch_id}
 操作人: {operator}
 导入模式: {import_mode}
 总记录数: {len(rows) + len(errors)}
 成功: {success_count}
 失败: {len(errors)}
-时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-        """.strip()
+时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}""".strip()
         
-        # 记录导入通知
         cursor.execute("""
             INSERT INTO notifications (user_id, title, body, category, is_read)
             VALUES (%s, %s, %s, %s, %s)
-        """, (notification_user_id, "学生名单导入日志", log_message, "system", 0))
+        """, (teacher_id, "学生名单导入日志", log_message, "system", 0))
         log_id = cursor.lastrowid
         
-        # 给每个新导入的学生发送激活邀请
         for user_id in created_user_ids:
-            # 获取学生信息
             cursor.execute("""
                 SELECT full_name, student_no FROM users WHERE id = %s
             """, (user_id,))
             student = cursor.fetchone()
             
             if student:
-                activation_message = f"""
-{student['full_name']} 同学您好：
+                activation_message = f"""{student['full_name']} 同学您好：
 
 您的账号已成功创建！
 学号：{student['student_no']}
@@ -411,8 +453,7 @@ async def upload_students(
 
 此致敬礼！
 教师管理系统
-{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-                """.strip()
+{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}""".strip()
                 
                 cursor.execute("""
                     INSERT INTO notifications (user_id, title, body, category, is_read)
@@ -442,7 +483,6 @@ def list_import_logs(
     with db() as conn:
         cursor = conn.cursor()
         
-        # 查询导入相关的系统通知
         offset = (page - 1) * page_size
         cursor.execute("""
             SELECT id, title, body, created_at 
@@ -454,14 +494,11 @@ def list_import_logs(
         """, (page_size, offset))
         rows = cursor.fetchall()
         
-        # 解析日志内容
         result = []
         for row in rows:
             body = row["body"]
-            # 从日志内容中提取信息
             log_info = {"id": row["id"], "created_at": row["created_at"]}
             
-            # 简单解析
             lines = body.split("\n")
             for line in lines:
                 line = line.strip()
@@ -480,7 +517,6 @@ def list_import_logs(
             
             result.append(log_info)
         
-        # 总数
         cursor.execute("""
             SELECT COUNT(*) as total 
             FROM notifications 
@@ -505,8 +541,6 @@ def get_import_errors(
     """获取某次导入的错误详情"""
     _require_teacher(authorization)
     
-    # 由于我们不存储错误详情，这里返回一个友好的提示
-    # 在实际系统中，错误详情会临时存储在内存中
     with db() as conn:
         cursor = conn.cursor()
         
@@ -535,35 +569,35 @@ def get_scores(exam_id: str = Query(...), authorization: Optional[str] = Header(
     with db() as conn:
         cursor = conn.cursor()
         
-        # 检查考试是否存在
         cursor.execute("SELECT title FROM exams WHERE id = %s", (int(exam_id),))
         exam = cursor.fetchone()
         
         if not exam:
             raise HTTPException(status_code=404, detail="考试不存在")
 
-        # 获取所有学生
-        cursor.execute("""
-            SELECT u.full_name as name, u.student_no as student_id, s.class_name, u.id as user_id
-            FROM users u 
-            JOIN students s ON u.id = s.user_id 
-            WHERE u.role = 'student'
-            ORDER BY u.student_no
-        """)
-        students = cursor.fetchall()
-        
-        # 获取成绩 - 使用 exam_attempts 和 exam_answers 或者 score_items
-        # 这里我们用一个简化的方式
-        result = []
-        for student in students:
-            result.append({
-                "name": student["name"],
-                "student_id": student["student_id"],
-                "class_name": student["class_name"],
-                "score": None,
-                "total": None,
-                "submitted_at": None
-            })
+        students = _list_students_with_class(conn)
+
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT sub.student_user_id, gr.exam_score AS score, gr.total_score AS total, gr.graded_at AS submitted_at
+            FROM grading_records gr
+            JOIN submissions sub ON gr.submission_id = sub.id
+            JOIN assignments a ON sub.assignment_id = a.id
+            WHERE a.title LIKE CONCAT('exam_', %s, '%%')
+        """, (exam_id,))
+        scores_map = {r["student_user_id"]: r for r in cur.fetchall()}
+
+    result = []
+    for s in students:
+        sc = scores_map.get(s["user_id"])
+        result.append({
+            "name": s["name"],
+            "student_id": s["student_id"],
+            "class_name": s["class_name"],
+            "score": float(sc["score"]) if sc else None,
+            "total": float(sc["total"]) if sc else None,
+            "submitted_at": sc["submitted_at"].strftime("%Y-%m-%d %H:%M:%S") if sc and sc["submitted_at"] else None,
+        })
 
     return {"exam_title": exam["title"], "rows": result}
 
@@ -582,14 +616,7 @@ def export_scores(exam_id: str = Query(...), authorization: Optional[str] = Head
         if not exam:
             raise HTTPException(status_code=404, detail="考试不存在")
 
-        cursor.execute("""
-            SELECT u.full_name as name, u.student_no as student_id, s.class_name
-            FROM users u 
-            JOIN students s ON u.id = s.user_id 
-            WHERE u.role = 'student'
-            ORDER BY u.student_no
-        """)
-        students = cursor.fetchall()
+        students = _list_students_with_class(conn)
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -626,3 +653,538 @@ def export_scores(exam_id: str = Query(...), authorization: Optional[str] = Head
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"}
     )
+
+
+class ExamCreate(BaseModel):
+    title: str
+
+
+@router.post("/api/teacher/exams")
+def create_exam(req: ExamCreate, authorization: Optional[str] = Header(None)):
+    require_teacher(authorization)
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO exams (course_id, title, exam_type, start_at, end_at, created_by)
+            VALUES (%s, %s, 'quiz', NOW(), DATE_ADD(NOW(), INTERVAL 7 DAY), 14)
+        """, (COURSE_ID, req.title))
+    return {"ok": True}
+
+
+class ExamUpdate(BaseModel):
+    title: Optional[str] = None
+    exam_type: Optional[str] = None
+    start_at: Optional[str] = None
+    end_at: Optional[str] = None
+
+
+class CleanupRequest(BaseModel):
+    titles: Optional[list[str]] = None
+
+
+@router.put("/api/teacher/exams/{exam_id}")
+def update_exam(exam_id: str, req: ExamUpdate, authorization: Optional[str] = Header(None)):
+    require_teacher(authorization)
+    with db() as conn:
+        cur = conn.cursor()
+        if req.title:
+            cur.execute("UPDATE exams SET title = %s WHERE id = %s", (req.title, exam_id))
+        if req.exam_type:
+            cur.execute("UPDATE exams SET exam_type = %s WHERE id = %s", (req.exam_type, exam_id))
+        if req.start_at:
+            cur.execute("UPDATE exams SET start_at = %s WHERE id = %s", (req.start_at, exam_id))
+        if req.end_at:
+            cur.execute("UPDATE exams SET end_at = %s WHERE id = %s", (req.end_at, exam_id))
+    return {"ok": True}
+
+
+@router.post("/api/teacher/exams/cleanup")
+def cleanup_exams(req: CleanupRequest, authorization: Optional[str] = Header(None)):
+    require_teacher(authorization)
+    defaults = [
+        "第 12 章 机器人系统开发环境配置 测验",
+        "第二章 CubeMX 编程测验",
+        "第三章 PicSimlab 仿真开发测验",
+    ]
+    titles = req.titles or defaults
+    affected = 0
+    with db() as conn:
+        for t in titles:
+            cur = conn.execute("DELETE FROM exams WHERE title=%s", (t,))
+            affected += cur.rowcount
+            rows = conn.execute("SELECT id FROM classroom_exams WHERE title=%s", (t,)).fetchall()
+            for r in rows:
+                eid = r["id"]
+                conn.execute("DELETE FROM classroom_exam_questions WHERE exam_id=%s", (eid,))
+                conn.execute("DELETE FROM classroom_exam_attempts WHERE exam_id=%s", (eid,))
+                conn.execute("DELETE FROM classroom_exams WHERE id=%s", (eid,))
+                affected += 1
+    return {"ok": True, "affected": affected}
+
+
+@router.delete("/api/teacher/exams/{exam_id}")
+def delete_exam(exam_id: str, authorization: Optional[str] = Header(None)):
+    require_teacher(authorization)
+    affected = 0
+    with db() as conn:
+        cur = conn.execute("DELETE FROM scores WHERE exam_id=%s", (exam_id,))
+        affected += cur.rowcount
+        cur2 = conn.execute("DELETE FROM exams WHERE id=%s", (exam_id,))
+        affected += cur2.rowcount
+        rows = conn.execute("SELECT id FROM classroom_exams WHERE id=%s", (exam_id,)).fetchall()
+        for r in rows:
+            eid = r["id"]
+            conn.execute("DELETE FROM classroom_exam_questions WHERE exam_id=%s", (eid,))
+            conn.execute("DELETE FROM classroom_exam_attempts WHERE exam_id=%s", (eid,))
+            conn.execute("DELETE FROM classroom_exams WHERE id=%s", (eid,))
+            affected += 1
+    return {"ok": True, "deleted": affected}
+
+
+# ───── GitHub 账号绑定状态看板 (F-T-004) ─────
+
+
+@router.get("/api/teacher/github-bindings/summary")
+def get_binding_summary(authorization: Optional[str] = Header(None)):
+    require_teacher(authorization)
+    with db() as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE role='student'"
+        ).fetchone()[0]
+        bound = conn.execute(
+            "SELECT COUNT(*) FROM github_bindings WHERE verify_status='approved'"
+        ).fetchone()[0]
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM github_bindings WHERE verify_status='pending'"
+        ).fetchone()[0]
+        unbound = total - bound - pending
+    return {"total": total, "bound": bound, "pending": pending, "unbound": max(unbound, 0)}
+
+
+@router.get("/api/teacher/github-bindings/list")
+def get_binding_list(
+    status: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    sort_by_status: bool = Query(False),
+    authorization: Optional[str] = Header(None)
+):
+    require_teacher(authorization)
+
+    with db() as conn:
+        query = """
+            SELECT u.full_name AS name, u.student_no AS student_id,
+                   COALESCE(s.class_name, '') AS class_name,
+                   COALESCE(g.github_username, '') AS github_username,
+                   COALESCE(g.verify_status, 'unbound') AS binding_status,
+                   COALESCE(g.github_name, '') AS github_name,
+                   g.verified_at
+            FROM users u
+            LEFT JOIN students s ON s.user_id = u.id
+            LEFT JOIN github_bindings g ON u.id = g.student_user_id
+            WHERE u.role = 'student'
+        """
+        conditions = []
+        params: list = []
+
+        if status and status != "all":
+            if status == "unbound":
+                conditions.append("(g.verify_status IS NULL OR g.verify_status NOT IN ('approved','pending'))")
+            else:
+                conditions.append("g.verify_status = %s")
+                params.append(status)
+
+        if search:
+            conditions.append(
+                "(u.full_name LIKE %s OR u.student_no LIKE %s OR g.github_username LIKE %s)"
+            )
+            like = f"%{search}%"
+            params.extend([like, like, like])
+
+        if conditions:
+            query += " AND " + " AND ".join(conditions)
+
+        if sort_by_status:
+            query += """
+                ORDER BY
+                    CASE
+                        WHEN g.verify_status IS NULL OR g.verify_status NOT IN ('approved','pending') THEN 0
+                        WHEN g.verify_status = 'pending' THEN 1
+                        WHEN g.verify_status = 'approved' THEN 2
+                    END,
+                    u.student_no
+            """
+        else:
+            query += " ORDER BY u.student_no"
+
+    with db() as conn:
+        rows = conn.execute(query, params).fetchall()
+
+    return [dict(r) for r in rows]
+
+
+class BatchStudentIds(BaseModel):
+    student_ids: list[str]
+
+
+@router.post("/api/teacher/github-bindings/batch-approve")
+def batch_approve_bindings(req: BatchStudentIds, authorization: Optional[str] = Header(None)):
+    require_teacher(authorization)
+    if not req.student_ids:
+        raise HTTPException(status_code=422, detail="请选择至少一名学生")
+    placeholders = ",".join(["%s"] * len(req.student_ids))
+    with db() as conn:
+        conn.execute(
+            f"UPDATE github_bindings g JOIN users u ON g.student_user_id=u.id "
+            f"SET g.verify_status='approved', g.verified_at=NOW() "
+            f"WHERE u.student_no IN ({placeholders}) AND g.verify_status='pending'",
+            req.student_ids
+        )
+    return {"ok": True, "approved": conn.rowcount}
+
+
+@router.post("/api/teacher/github-bindings/reject")
+def reject_binding(req: BatchStudentIds, authorization: Optional[str] = Header(None)):
+    require_teacher(authorization)
+    if not req.student_ids:
+        raise HTTPException(status_code=422, detail="请选择至少一名学生")
+    placeholders = ",".join(["%s"] * len(req.student_ids))
+    with db() as conn:
+        conn.execute(
+            f"UPDATE github_bindings g JOIN users u ON g.student_user_id=u.id "
+            f"SET g.verify_status='rejected', g.github_username='', g.github_name='', g.verified_at=NULL "
+            f"WHERE u.student_no IN ({placeholders})",
+            req.student_ids
+        )
+    return {"ok": True}
+
+
+@router.post("/api/teacher/github-bindings/send-reminder")
+def send_binding_reminder(req: BatchStudentIds, authorization: Optional[str] = Header(None)):
+    require_teacher(authorization)
+    if not req.student_ids:
+        raise HTTPException(status_code=422, detail="请选择至少一名学生")
+    placeholders = ",".join(["%s"] * len(req.student_ids))
+    with db() as conn:
+        rows = conn.execute(
+            f"SELECT u.full_name AS name FROM users u "
+            f"LEFT JOIN github_bindings g ON g.student_user_id=u.id "
+            f"WHERE u.student_no IN ({placeholders}) "
+            f"AND u.role='student' "
+            f"AND (g.verify_status IS NULL OR g.verify_status NOT IN ('approved','pending'))",
+            req.student_ids
+        ).fetchall()
+    names = [r["name"] for r in rows]
+    return {"ok": True, "reminded": len(names), "students": names}
+
+
+# ───── 进度看板 API (F-T-013) ─────
+
+HEATMAP_STATUS = {
+    "submitted": "绿",
+    "late": "黄",
+    "missing": "红",
+    "not_published": "灰"
+}
+
+
+class ProgressFilter(BaseModel):
+    course_id: Optional[int] = None
+    semester: Optional[str] = None
+    top_n_lowest: Optional[int] = 5
+
+
+@router.get("/api/teacher/progress/heatmap")
+def get_progress_heatmap(
+    course_id: Optional[int] = Query(None),
+    semester: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(None)
+):
+    require_teacher(authorization)
+
+    with db() as conn:
+        student_query = """
+            SELECT s.user_id AS student_id, u.full_name AS name,
+                   u.student_no, COALESCE(s.class_name, '') AS class_name
+            FROM students s
+            JOIN users u ON s.user_id = u.id
+            WHERE u.role = 'student'
+        """
+        students = conn.execute(student_query).fetchall()
+
+        assignment_query = """
+            SELECT a.id, a.title, a.deadline, a.created_at, a.course_id,
+                   c.name AS course_name
+            FROM assignments a
+            JOIN courses c ON a.course_id = c.id
+        """
+        params = []
+        if course_id:
+            assignment_query += " WHERE a.course_id = %s"
+            params.append(course_id)
+        if semester:
+            assignment_query += " AND c.term = %s" if course_id else " WHERE c.term = %s"
+            params.append(semester)
+        assignment_query += " ORDER BY a.deadline"
+
+        assignments = conn.execute(assignment_query, params).fetchall()
+
+        if not assignments:
+            return {"students": [], "assignments": [], "matrix": []}
+
+        assignment_ids = [a["id"] for a in assignments]
+        student_ids = [s["student_id"] for s in students]
+
+        if not assignment_ids or not student_ids:
+            return {"students": [], "assignments": [], "matrix": []}
+
+        placeholders_a = ",".join(["%s"] * len(assignment_ids))
+        placeholders_s = ",".join(["%s"] * len(student_ids))
+
+        submissions = conn.execute(f"""
+            SELECT sub.assignment_id, sub.student_user_id, sub.is_late,
+                   sub.submitted_at, sub.version_no, sub.grading_status
+            FROM submissions sub
+            WHERE sub.assignment_id IN ({placeholders_a})
+            AND sub.student_user_id IN ({placeholders_s})
+            AND sub.version_no = (
+                SELECT MAX(s2.version_no)
+                FROM submissions s2
+                WHERE s2.assignment_id = sub.assignment_id
+                AND s2.student_user_id = sub.student_user_id
+            )
+        """, assignment_ids + student_ids).fetchall()
+
+        submission_map = {
+            (str(s["assignment_id"]), str(s["student_user_id"])): dict(s)
+            for s in submissions
+        }
+
+        now = datetime.now()
+        matrix = []
+        for student in students:
+            row = []
+            for assignment in assignments:
+                key = (str(assignment["id"]), str(student["student_id"]))
+                sub = submission_map.get(key)
+
+                if sub:
+                    if sub["is_late"]:
+                        status = "late"
+                    else:
+                        status = "submitted"
+                    cell = {
+                        "assignment_id": assignment["id"],
+                        "student_id": student["student_id"],
+                        "status": status,
+                        "submitted_at": sub["submitted_at"].isoformat() if sub["submitted_at"] else None,
+                        "version_no": sub["version_no"],
+                        "grading_status": sub["grading_status"]
+                    }
+                elif assignment["deadline"] < now:
+                    cell = {
+                        "assignment_id": assignment["id"],
+                        "student_id": student["student_id"],
+                        "status": "missing",
+                        "submitted_at": None,
+                        "version_no": None,
+                        "grading_status": None
+                    }
+                else:
+                    cell = {
+                        "assignment_id": assignment["id"],
+                        "student_id": student["student_id"],
+                        "status": "not_published",
+                        "submitted_at": None,
+                        "version_no": None,
+                        "grading_status": None
+                    }
+                row.append(cell)
+            matrix.append({
+                "student_id": student["student_id"],
+                "name": student["name"],
+                "student_no": student["student_no"],
+                "class_name": student["class_name"],
+                "cells": row
+            })
+
+        return {
+            "students": [dict(s) for s in students],
+            "assignments": [dict(a) for a in assignments],
+            "matrix": matrix
+        }
+
+
+@router.get("/api/teacher/progress/chart")
+def get_progress_chart(
+    course_id: Optional[int] = Query(None),
+    semester: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(None)
+):
+    require_teacher(authorization)
+
+    with db() as conn:
+        total_students = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM users WHERE role='student'"
+        ).fetchone()["cnt"]
+
+        if total_students == 0:
+            return {"tasks": []}
+
+        assignment_query = """
+            SELECT a.id, a.title, a.deadline, a.created_at, a.course_id,
+                   c.name AS course_name
+            FROM assignments a
+            JOIN courses c ON a.course_id = c.id
+        """
+        params = []
+        if course_id:
+            assignment_query += " WHERE a.course_id = %s"
+            params.append(course_id)
+        if semester:
+            assignment_query += " AND c.term = %s" if course_id else " WHERE c.term = %s"
+            params.append(semester)
+        assignment_query += " ORDER BY a.deadline"
+
+        assignments = conn.execute(assignment_query, params).fetchall()
+
+        if not assignments:
+            return {"tasks": []}
+
+        now = datetime.now()
+        tasks = []
+        for a in assignments:
+            assignment_id = a["id"]
+
+            submitted_count = conn.execute("""
+                SELECT COUNT(DISTINCT student_user_id) AS cnt
+                FROM submissions
+                WHERE assignment_id = %s
+            """, (assignment_id,)).fetchone()["cnt"]
+
+            is_past_deadline = a["deadline"] < now
+
+            if is_past_deadline:
+                completion_rate = submitted_count / total_students if total_students > 0 else 0
+            else:
+                completion_rate = None
+
+            tasks.append({
+                "id": assignment_id,
+                "title": a["title"],
+                "deadline": a["deadline"].isoformat() if a["deadline"] else None,
+                "created_at": a["created_at"].isoformat() if a["created_at"] else None,
+                "course_name": a["course_name"],
+                "total_students": total_students,
+                "submitted_count": submitted_count,
+                "completion_rate": round(completion_rate, 2) if completion_rate is not None else None,
+                "is_past_deadline": is_past_deadline
+            })
+
+        return {"tasks": tasks}
+
+
+@router.get("/api/teacher/progress/matrix")
+def get_progress_matrix(
+    course_id: Optional[int] = Query(None),
+    semester: Optional[str] = Query(None),
+    bottom_n: int = Query(5, description="完成率最低的前N名学生置顶"),
+    sort_order: str = Query("completion_asc", description="排序方式"),
+    authorization: Optional[str] = Header(None)
+):
+    require_teacher(authorization)
+
+    heatmap_data = get_progress_heatmap(course_id=course_id, semester=semester, authorization=authorization)
+
+    exams = []
+    for assn in heatmap_data["assignments"]:
+        deadline = assn.get("deadline", "")
+        if isinstance(deadline, datetime):
+            deadline_str = deadline.strftime("%Y-%m-%d %H:%M:%S")
+            is_active = datetime.now() >= deadline
+        elif isinstance(deadline, str) and deadline:
+            deadline_str = deadline
+            try:
+                deadline_dt = datetime.strptime(deadline, "%Y-%m-%d %H:%M:%S")
+                is_active = datetime.now() >= deadline_dt
+            except:
+                is_active = False
+        else:
+            deadline_str = ""
+            is_active = False
+
+        exams.append({
+            "id": f"hw{assn['id']}",
+            "title": assn["title"],
+            "deadline": deadline_str,
+            "published_at": assn.get("created_at", ""),
+            "semester": semester or "2024-2025-2",
+            "is_active": is_active,
+            "total_students": len(heatmap_data["students"]),
+            "submitted": 0,
+            "completion_rate": 0.0
+        })
+
+    students = []
+    for row in heatmap_data["matrix"]:
+        student_id = row["student_id"]
+        cells = row["cells"]
+
+        statuses = {}
+        for idx, cell in enumerate(cells):
+            exam_id = f"hw{heatmap_data['assignments'][idx]['id']}"
+            status_map = {
+                "submitted": "submitted",
+                "late": "late",
+                "missing": "unsubmitted",
+                "not_published": "not_published"
+            }
+            status = status_map.get(cell["status"], "not_published")
+
+            status_info = {"status": status}
+            if cell.get("submitted_at"):
+                status_info["submitted_at"] = cell["submitted_at"]
+            if cell.get("score") is not None:
+                status_info["score"] = cell["score"]
+                status_info["total"] = 100
+
+            statuses[exam_id] = status_info
+
+        completed = sum(1 for c in cells if c["status"] in ["submitted", "late"])
+        past_deadline = sum(1 for c in cells if c["status"] in ["submitted", "late", "missing"])
+
+        if past_deadline > 0:
+            completion_rate = completed / past_deadline
+        else:
+            completion_rate = 1.0
+
+        students.append({
+            "student_id": student_id,
+            "name": row["name"],
+            "student_no": row["student_no"],
+            "class_name": row["class_name"],
+            "completion_rate": round(completion_rate, 3),
+            "highlight": False,
+            "statuses": statuses
+        })
+
+    if sort_order == "completion_asc":
+        students.sort(key=lambda x: x["completion_rate"])
+    else:
+        students.sort(key=lambda x: x["name"])
+
+    for i, student in enumerate(students):
+        student["highlight"] = i < bottom_n and student["completion_rate"] < 1.0
+
+    for exam in exams:
+        submitted = 0
+        for student in students:
+            st = student["statuses"].get(exam["id"])
+            if st and (st["status"] == "submitted" or st["status"] == "late"):
+                submitted += 1
+        exam["submitted"] = submitted
+        exam["completion_rate"] = round(submitted / len(students), 3) if students else 0.0
+
+    return {
+        "students": students,
+        "exams": exams,
+    }
