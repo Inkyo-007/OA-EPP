@@ -46,3 +46,6 @@ secrets.yml
 *.sqlite
 *.sqlite3
 .local_exam_data/
+
+*.ps1
+exam-requirements.md
