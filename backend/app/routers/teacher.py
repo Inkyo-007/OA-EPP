@@ -1,11 +1,12 @@
 import os
 import io
+import uuid
 import chardet
+import csv
 from datetime import datetime
-from urllib.parse import quote
-from fastapi import APIRouter, HTTPException, Header, UploadFile, File, Query
+from fastapi import APIRouter, HTTPException, Header, UploadFile, File, Query, Form
 from fastapi.responses import StreamingResponse
-from typing import Optional
+from typing import Optional, List
 from pydantic import BaseModel
 from app.database import db
 from app.auth_utils import create_token, hash_password, verify_teacher_token, require_teacher
@@ -13,11 +14,24 @@ from app.sync_exams import sync_exams
 from pypinyin import lazy_pinyin, Style
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
+from dotenv import load_dotenv
+
+load_dotenv()
 
 router = APIRouter()
 
 TEACHER_PASSWORD = os.environ.get("TEACHER_PASSWORD", "admin123")
 COURSE_ID = int(os.environ.get("COURSE_ID", "1"))
+
+
+def _require_teacher(authorization: Optional[str]):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="请先登录")
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        verify_teacher_token(token)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
 
 
 def _name_to_pinyin(name: str):
@@ -61,184 +75,13 @@ def teacher_login(req: LoginRequest):
     return {"token": token}
 
 
-@router.post("/api/teacher/students")
-async def upload_students(
-    file: UploadFile = File(...),
-    authorization: Optional[str] = Header(None)
-):
-    """上传学生名单 CSV，同步到远程 users/students/enrollments 表"""
-    require_teacher(authorization)
-
-    raw = await file.read()
-    encoding = chardet.detect(raw)["encoding"] or "utf-8"
-    text = raw.decode(encoding, errors="replace")
-
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    if not lines:
-        raise HTTPException(status_code=422, detail="文件为空")
-
-    data_lines = lines[1:] if lines[0].startswith("姓名") or lines[0].startswith("name") else lines
-
-    records = []
-    for line in data_lines:
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 2:
-            continue
-        name = parts[0]
-        student_id = parts[1]
-        class_name = parts[2] if len(parts) > 2 else ""
-        if not name or not student_id:
-            continue
-        records.append((name, student_id, class_name))
-
-    if not records:
-        raise HTTPException(status_code=422, detail="CSV 中没有有效数据行")
-
-    with db() as conn:
-        cur = conn.cursor()
-        count = 0
-        for name, student_no, class_name in records:
-            email = f"{student_no}@stu.oaepp.dev"
-            cur.execute("""
-                INSERT INTO users (role, student_no, email, password_hash, full_name)
-                VALUES ('student', %s, %s, '', %s)
-                ON DUPLICATE KEY UPDATE full_name = VALUES(full_name)
-            """, (student_no, email, name))
-            user_id = cur.lastrowid
-            if not user_id:
-                cur.execute("SELECT id FROM users WHERE student_no = %s", (student_no,))
-                user_id = cur.fetchone()["id"]
-
-            cur.execute("""
-                INSERT INTO students (user_id, class_name)
-                VALUES (%s, %s)
-                ON DUPLICATE KEY UPDATE class_name = VALUES(class_name)
-            """, (user_id, class_name))
-
-            cur.execute("""
-                INSERT IGNORE INTO enrollments (course_id, student_user_id)
-                VALUES (%s, %s)
-            """, (COURSE_ID, user_id))
-            count += 1
-
-    return {"count": count}
-
-
-class AddStudentRequest(BaseModel):
-    name: str
-    student_id: str
-    class_name: str = ""
-
-
-@router.post("/api/teacher/students/add")
-def add_student(req: AddStudentRequest, authorization: Optional[str] = Header(None)):
-    """添加单个学生"""
-    require_teacher(authorization)
-    req.name = req.name.strip()
-    req.student_id = req.student_id.strip()
-    if not req.name or not req.student_id:
-        raise HTTPException(status_code=422, detail="姓名和学号不能为空")
-
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT u.full_name FROM users u WHERE u.student_no = %s",
-            (req.student_id,)
-        )
-        existing = cur.fetchone()
-        if existing:
-            raise HTTPException(status_code=409,
-                                detail=f"学号 {req.student_id} 已存在（{existing['full_name']}）")
-
-        email = f"{req.student_id}@stu.oaepp.dev"
-        cur.execute(
-            "INSERT INTO users (role, student_no, email, password_hash, full_name) VALUES ('student', %s, %s, '', %s)",
-            (req.student_id, email, req.name)
-        )
-        user_id = cur.lastrowid
-
-        cur.execute(
-            "INSERT INTO students (user_id, class_name) VALUES (%s, %s)",
-            (user_id, req.class_name.strip())
-        )
-        cur.execute(
-            "INSERT IGNORE INTO enrollments (course_id, student_user_id) VALUES (%s, %s)",
-            (COURSE_ID, user_id)
-        )
-        cur.execute(
-            "INSERT INTO student_accounts (student_id, password_hash) VALUES (%s, %s)",
-            (req.student_id, hash_password(req.student_id)),
-        )
-    return {"ok": True}
-
-
-@router.delete("/api/teacher/students/{student_id}")
-def delete_student(student_id: str, authorization: Optional[str] = Header(None)):
-    """删除单个学生（取消选课，保留用户记录）"""
-    require_teacher(authorization)
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT u.id, u.full_name FROM users u WHERE u.student_no = %s AND u.role = 'student'",
-            (student_id,)
-        )
-        student = cur.fetchone()
-        if not student:
-            raise HTTPException(status_code=404, detail="学号不存在")
-
-        cur.execute(
-            "DELETE FROM enrollments WHERE course_id = %s AND student_user_id = %s",
-            (COURSE_ID, student["id"])
-        )
-    return {"ok": True, "deleted": student["full_name"]}
-
-
-@router.delete("/api/teacher/students")
-def clear_all_students(authorization: Optional[str] = Header(None)):
-    """清空当前课程全部选课"""
-    require_teacher(authorization)
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT COUNT(*) AS cnt FROM enrollments WHERE course_id = %s",
-            (COURSE_ID,)
-        )
-        count = cur.fetchone()["cnt"]
-        cur.execute("DELETE FROM enrollments WHERE course_id = %s", (COURSE_ID,))
-    return {"ok": True, "deleted_count": count}
-
-
-@router.post("/api/teacher/reset")
-def new_semester_reset(authorization: Optional[str] = Header(None)):
-    """新学期重置：清空当前课程选课"""
-    require_teacher(authorization)
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT COUNT(*) AS cnt FROM enrollments WHERE course_id = %s",
-            (COURSE_ID,)
-        )
-        students = cur.fetchone()["cnt"]
-        cur.execute("DELETE FROM enrollments WHERE course_id = %s", (COURSE_ID,))
-    return {"ok": True, "deleted_students": students, "deleted_scores": 0}
-
-
-@router.get("/api/teacher/students/list")
-def list_students(authorization: Optional[str] = Header(None)):
-    """获取全部学生名单"""
-    require_teacher(authorization)
-    with db() as conn:
-        rows = _list_students_with_class(conn)
-    return [{"name": r["name"], "student_id": r["student_id"], "class_name": r["class_name"]} for r in rows]
-
-
 @router.get("/api/teacher/exams")
 def list_exams(authorization: Optional[str] = Header(None)):
     require_teacher(authorization)
     with db() as conn:
         cur = conn.cursor()
         cur.execute("""
-            SELECT id, title, exam_type, start_at, end_at
+            SELECT id, title, exam_type, start_at, end_at, is_active
             FROM exams WHERE course_id = %s ORDER BY id
         """, (COURSE_ID,))
         exams = cur.fetchall()
@@ -249,7 +92,7 @@ def list_exams(authorization: Optional[str] = Header(None)):
         with db() as conn:
             cur = conn.cursor()
             cur.execute("""
-                SELECT id, title, exam_type, start_at, end_at
+                SELECT id, title, exam_type, start_at, end_at, is_active
                 FROM exams WHERE course_id = %s ORDER BY id
             """, (COURSE_ID,))
             exams = cur.fetchall()
@@ -322,11 +165,498 @@ def list_exams(authorization: Optional[str] = Header(None)):
     return result
 
 
+@router.get("/api/teacher/students/list")
+def list_students(authorization: Optional[str] = Header(None)):
+    """获取全部学生名单"""
+    _require_teacher(authorization)
+    
+    with db() as conn:
+        rows = _list_students_with_class(conn)
+    
+    return [{"name": r["name"], "student_id": r["student_id"], "class_name": r["class_name"]} for r in rows]
+
+
+class AddStudentRequest(BaseModel):
+    name: str
+    student_id: str
+    class_name: str = ""
+
+
+@router.post("/api/teacher/students/add")
+def add_student(req: AddStudentRequest, authorization: Optional[str] = Header(None)):
+    """添加单个学生"""
+    _require_teacher(authorization)
+    req.name = req.name.strip()
+    req.student_id = req.student_id.strip()
+    
+    if not req.name or not req.student_id:
+        raise HTTPException(status_code=422, detail="姓名和学号不能为空")
+    
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT u.full_name FROM users u WHERE u.student_no = %s",
+            (req.student_id,)
+        )
+        existing = cur.fetchone()
+        if existing:
+            raise HTTPException(status_code=409,
+                                detail=f"学号 {req.student_id} 已存在（{existing['full_name']}）")
+
+        email = f"{req.student_id}@stu.oaepp.dev"
+        cur.execute(
+            "INSERT INTO users (role, student_no, email, password_hash, full_name) VALUES ('student', %s, %s, '', %s)",
+            (req.student_id, email, req.name)
+        )
+        user_id = cur.lastrowid
+
+        cur.execute(
+            "INSERT INTO students (user_id, class_name) VALUES (%s, %s)",
+            (user_id, req.class_name.strip())
+        )
+        cur.execute(
+            "INSERT IGNORE INTO enrollments (course_id, student_user_id) VALUES (%s, %s)",
+            (COURSE_ID, user_id)
+        )
+        cur.execute(
+            "INSERT INTO student_accounts (student_id, password_hash) VALUES (%s, %s)",
+            (req.student_id, hash_password(req.student_id)),
+        )
+
+    return {"ok": True}
+
+
+@router.delete("/api/teacher/students/{student_id}")
+def delete_student(student_id: str, authorization: Optional[str] = Header(None)):
+    """删除单个学生"""
+    _require_teacher(authorization)
+    
+    with db() as conn:
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT id, full_name FROM users WHERE student_no = %s", (student_id,))
+        user = cursor.fetchone()
+        
+        if not user:
+            raise HTTPException(status_code=404, detail="学号不存在")
+
+        user_id = user["id"]
+        
+        cursor.execute("DELETE FROM enrollments WHERE student_user_id = %s", (user_id,))
+        cursor.execute("DELETE FROM students WHERE user_id = %s", (user_id,))
+        cursor.execute("DELETE FROM users WHERE id = %s", (user_id,))
+    
+    return {"ok": True, "deleted": user["full_name"]}
+
+
+@router.delete("/api/teacher/students")
+def clear_all_students(authorization: Optional[str] = Header(None)):
+    """清空全部学生名单"""
+    _require_teacher(authorization)
+    
+    with db() as conn:
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT COUNT(*) as cnt FROM users WHERE role = 'student'")
+        count = cursor.fetchone()["cnt"]
+        
+        cursor.execute("""
+            DELETE e FROM enrollments e
+            JOIN users u ON e.student_user_id = u.id
+            WHERE u.role = 'student'
+        """)
+        cursor.execute("DELETE FROM students WHERE user_id IN (SELECT id FROM users WHERE role = 'student')")
+        cursor.execute("DELETE FROM users WHERE role = 'student'")
+    
+    return {"ok": True, "deleted_count": count}
+
+
+@router.post("/api/teacher/students")
+async def upload_students(
+    file: UploadFile = File(...),
+    import_mode: str = Form("incremental"),
+    authorization: Optional[str] = Header(None)
+):
+    """上传学生名单 CSV（支持增量/全量覆盖模式，UTF-8/GBK编码）"""
+    _require_teacher(authorization)
+    
+    batch_id = str(uuid.uuid4())[:8]
+    operator = "teacher"
+    
+    content = await file.read()
+    detected = chardet.detect(content)
+    encoding = detected.get("encoding", "utf-8") or "utf-8"
+    
+    try:
+        text = content.decode(encoding)
+    except UnicodeDecodeError:
+        try:
+            text = content.decode("gbk")
+        except UnicodeDecodeError:
+            text = content.decode("utf-8", errors="replace")
+    
+    lines = text.splitlines()
+    reader = csv.DictReader(lines)
+    
+    if reader.fieldnames:
+        reader.fieldnames = [f.strip().lstrip("\ufeff") for f in reader.fieldnames]
+    fields = reader.fieldnames or []
+    
+    if "学号" not in fields or "姓名" not in fields:
+        raise HTTPException(status_code=422, detail="CSV 格式错误：缺少必要字段「学号」或「姓名」")
+    
+    existing_student_ids = set()
+    existing_student_users = {}
+    
+    with db() as conn:
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT u.student_no, u.id FROM users u
+            WHERE u.role = 'student'
+        """)
+        for row in cursor.fetchall():
+            existing_student_ids.add(row["student_no"])
+            existing_student_users[row["student_no"]] = row["id"]
+        
+        cursor.execute("SELECT user_id FROM teachers LIMIT 1")
+        teacher = cursor.fetchone()
+        if not teacher:
+            raise HTTPException(status_code=500, detail="没有找到教师用户")
+        
+        teacher_id = teacher["user_id"]
+        
+        cursor.execute("SELECT id FROM courses LIMIT 1")
+        course = cursor.fetchone()
+        course_id = course["id"] if course else None
+        
+        if import_mode == "full":
+            cursor.execute("""
+                DELETE e FROM enrollments e
+                JOIN users u ON e.student_user_id = u.id
+                WHERE u.role = 'student'
+            """)
+            cursor.execute("DELETE FROM students WHERE user_id IN (SELECT id FROM users WHERE role = 'student')")
+            cursor.execute("DELETE FROM users WHERE role = 'student'")
+            existing_student_ids = set()
+            existing_student_users = {}
+        
+        rows = []
+        errors = []
+        student_ids_in_file = set()
+        seen_student_ids = set()
+        
+        for idx, row in enumerate(reader, start=2):
+            student_id = str(row.get("学号", "")).strip()
+            name = str(row.get("姓名", "")).strip()
+            class_name = str(row.get("班级", "")).strip()
+            course_name = str(row.get("课程", "")).strip()
+            
+            row_errors = []
+            if not student_id:
+                row_errors.append("学号不能为空")
+            if not name:
+                row_errors.append("姓名不能为空")
+            
+            if student_id and student_id in seen_student_ids:
+                row_errors.append(f"学号 {student_id} 在文件中重复")
+            if student_id and student_id in existing_student_ids and import_mode == "incremental":
+                row_errors.append(f"学号 {student_id} 已存在于系统中")
+            
+            if not row_errors:
+                seen_student_ids.add(student_id)
+                student_ids_in_file.add(student_id)
+                rows.append({
+                    "student_id": student_id,
+                    "name": name,
+                    "class_name": class_name,
+                    "course_name": course_name,
+                    "line": idx
+                })
+            else:
+                errors.append({
+                    "line": idx,
+                    "raw": row,
+                    "errors": row_errors
+                })
+        
+        success_count = 0
+        created_user_ids = []
+        
+        for row in rows:
+            try:
+                email = f"{row['student_id']}@stu.oaepp.dev"
+                cursor.execute("""
+                    INSERT INTO users (role, student_no, email, password_hash, full_name)
+                    VALUES ('student', %s, %s, '', %s)
+                """, (row["student_id"], email, row["name"]))
+                user_id = cursor.lastrowid
+                created_user_ids.append(user_id)
+                
+                cursor.execute("""
+                    INSERT INTO students (user_id, class_name)
+                    VALUES (%s, %s)
+                """, (user_id, row["class_name"] or "默认班级"))
+                
+                if course_id:
+                    cursor.execute("""
+                        INSERT INTO enrollments (course_id, student_user_id)
+                        VALUES (%s, %s)
+                    """, (course_id, user_id))
+                
+                cursor.execute("""
+                    INSERT INTO student_accounts (student_id, password_hash)
+                    VALUES (%s, %s)
+                """, (row["student_id"], hash_password(row["student_id"])))
+                
+                success_count += 1
+            except Exception as e:
+                errors.append({
+                    "line": row["line"],
+                    "raw": {
+                        "学号": row["student_id"],
+                        "姓名": row["name"],
+                        "班级": row["class_name"],
+                        "课程": row["course_name"]
+                    },
+                    "errors": [str(e)]
+                })
+        
+        log_message = f"""批次号: {batch_id}
+操作人: {operator}
+导入模式: {import_mode}
+总记录数: {len(rows) + len(errors)}
+成功: {success_count}
+失败: {len(errors)}
+时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}""".strip()
+        
+        cursor.execute("""
+            INSERT INTO notifications (user_id, title, body, category, is_read)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (teacher_id, "学生名单导入日志", log_message, "system", 0))
+        log_id = cursor.lastrowid
+        
+        for user_id in created_user_ids:
+            cursor.execute("""
+                SELECT full_name, student_no FROM users WHERE id = %s
+            """, (user_id,))
+            student = cursor.fetchone()
+            
+            if student:
+                activation_message = f"""{student['full_name']} 同学您好：
+
+您的账号已成功创建！
+学号：{student['student_no']}
+初始密码：{student['student_no']}
+
+请及时登录并修改密码。
+
+此致敬礼！
+教师管理系统
+{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}""".strip()
+                
+                cursor.execute("""
+                    INSERT INTO notifications (user_id, title, body, category, is_read)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (user_id, "账号激活通知", activation_message, "announcement", 0))
+        
+        return {
+            "batch_id": batch_id,
+            "import_mode": import_mode,
+            "total": len(rows) + len(errors),
+            "success_count": success_count,
+            "error_count": len(errors),
+            "errors": errors,
+            "log_id": log_id
+        }
+
+
+@router.get("/api/teacher/import-logs")
+def list_import_logs(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    authorization: Optional[str] = Header(None)
+):
+    """获取导入日志列表"""
+    _require_teacher(authorization)
+    
+    with db() as conn:
+        cursor = conn.cursor()
+        
+        offset = (page - 1) * page_size
+        cursor.execute("""
+            SELECT id, title, body, created_at 
+            FROM notifications 
+            WHERE category = 'system' 
+            AND title LIKE '学生名单导入日志'
+            ORDER BY created_at DESC
+            LIMIT %s OFFSET %s
+        """, (page_size, offset))
+        rows = cursor.fetchall()
+        
+        result = []
+        for row in rows:
+            body = row["body"]
+            log_info = {"id": row["id"], "created_at": row["created_at"]}
+            
+            lines = body.split("\n")
+            for line in lines:
+                line = line.strip()
+                if line.startswith("批次号:"):
+                    log_info["batch_id"] = line.split(":", 1)[1].strip()
+                elif line.startswith("操作人:"):
+                    log_info["operator"] = line.split(":", 1)[1].strip()
+                elif line.startswith("导入模式:"):
+                    log_info["import_mode"] = line.split(":", 1)[1].strip()
+                elif line.startswith("总记录数:"):
+                    log_info["total_records"] = int(line.split(":", 1)[1].strip())
+                elif line.startswith("成功:"):
+                    log_info["success_count"] = int(line.split(":", 1)[1].strip())
+                elif line.startswith("失败:"):
+                    log_info["error_count"] = int(line.split(":", 1)[1].strip())
+            
+            result.append(log_info)
+        
+        cursor.execute("""
+            SELECT COUNT(*) as total 
+            FROM notifications 
+            WHERE category = 'system' 
+            AND title LIKE '学生名单导入日志'
+        """)
+        total = cursor.fetchone()["total"]
+    
+    return {
+        "data": result,
+        "total": total,
+        "page": page,
+        "page_size": page_size
+    }
+
+
+@router.get("/api/teacher/import-logs/{log_id}/errors")
+def get_import_errors(
+    log_id: int,
+    authorization: Optional[str] = Header(None)
+):
+    """获取某次导入的错误详情"""
+    _require_teacher(authorization)
+    
+    with db() as conn:
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT id, title, body, created_at 
+            FROM notifications 
+            WHERE id = %s
+        """, (log_id,))
+        log = cursor.fetchone()
+        
+        if not log:
+            raise HTTPException(status_code=404, detail="日志不存在")
+    
+    return {
+        "log_id": log_id,
+        "message": "完整错误详情在导入完成后已在响应中返回，详细信息请查看导入时的反馈。",
+        "log_content": log["body"]
+    }
+
+
+@router.get("/api/teacher/scores")
+def get_scores(exam_id: str = Query(...), authorization: Optional[str] = Header(None)):
+    """获取某次考试的所有学生成绩"""
+    _require_teacher(authorization)
+    
+    with db() as conn:
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT title FROM exams WHERE id = %s", (int(exam_id),))
+        exam = cursor.fetchone()
+        
+        if not exam:
+            raise HTTPException(status_code=404, detail="考试不存在")
+
+        students = _list_students_with_class(conn)
+
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT sub.student_user_id, gr.exam_score AS score, gr.total_score AS total, gr.graded_at AS submitted_at
+            FROM grading_records gr
+            JOIN submissions sub ON gr.submission_id = sub.id
+            JOIN assignments a ON sub.assignment_id = a.id
+            WHERE a.title LIKE CONCAT('exam_', %s, '%%')
+        """, (exam_id,))
+        scores_map = {r["student_user_id"]: r for r in cur.fetchall()}
+
+    result = []
+    for s in students:
+        sc = scores_map.get(s["user_id"])
+        result.append({
+            "name": s["name"],
+            "student_id": s["student_id"],
+            "class_name": s["class_name"],
+            "score": float(sc["score"]) if sc else None,
+            "total": float(sc["total"]) if sc else None,
+            "submitted_at": sc["submitted_at"].strftime("%Y-%m-%d %H:%M:%S") if sc and sc["submitted_at"] else None,
+        })
+
+    return {"exam_title": exam["title"], "rows": result}
+
+
+@router.get("/api/teacher/scores/export")
+def export_scores(exam_id: str = Query(...), authorization: Optional[str] = Header(None)):
+    """导出成绩 Excel"""
+    _require_teacher(authorization)
+
+    with db() as conn:
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT title FROM exams WHERE id = %s", (int(exam_id),))
+        exam = cursor.fetchone()
+        
+        if not exam:
+            raise HTTPException(status_code=404, detail="考试不存在")
+
+        students = _list_students_with_class(conn)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = exam["title"][:31] if len(exam["title"]) > 31 else exam["title"]
+
+    header_fill = PatternFill("solid", fgColor="4472C4")
+    header_font = Font(bold=True, color="FFFFFF")
+    headers = ["姓名", "学号", "班级"]
+    col_widths = [12, 14, 20]
+
+    for col, (h, w) in enumerate(zip(headers, col_widths), 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+        ws.column_dimensions[cell.column_letter].width = w
+
+    for row_idx, student in enumerate(students, 2):
+        ws.cell(row=row_idx, column=1, value=student["name"])
+        ws.cell(row=row_idx, column=2, value=student["student_id"])
+        ws.cell(row=row_idx, column=3, value=student["class_name"])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    from urllib.parse import quote
+    date_str = datetime.now().strftime("%Y%m%d")
+    filename = f"成绩单_{exam['title']}_{date_str}.xlsx"
+    encoded_filename = quote(filename, safe="")
+
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"}
+    )
+
+
 class ExamCreate(BaseModel):
     title: str
-    exam_type: str = "quiz"
-    start_at: str
-    end_at: str
 
 
 @router.post("/api/teacher/exams")
@@ -368,113 +698,8 @@ def update_exam(exam_id: str, req: ExamUpdate, authorization: Optional[str] = He
     return {"ok": True}
 
 
-@router.get("/api/teacher/scores")
-def get_scores(exam_id: str = Query(...), authorization: Optional[str] = Header(None)):
-    """获取某次考试的所有学生成绩"""
-    require_teacher(authorization)
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT title FROM exams WHERE id = %s", (exam_id,))
-        exam = cur.fetchone()
-        if not exam:
-            raise HTTPException(status_code=404, detail="考试不存在")
-
-        students = _list_students_with_class(conn)
-
-        cur.execute("""
-            SELECT sub.student_user_id, gr.exam_score AS score, gr.total_score AS total, gr.graded_at AS submitted_at
-            FROM grading_records gr
-            JOIN submissions sub ON gr.submission_id = sub.id
-            JOIN assignments a ON sub.assignment_id = a.id
-            WHERE a.title LIKE CONCAT('exam_', %s, '%%')
-        """, (exam_id,))
-        scores_map = {r["student_user_id"]: r for r in cur.fetchall()}
-
-    result = []
-    for s in students:
-        sc = scores_map.get(s["user_id"])
-        result.append({
-            "name": s["name"],
-            "student_id": s["student_id"],
-            "class_name": s["class_name"],
-            "score": float(sc["score"]) if sc else None,
-            "total": float(sc["total"]) if sc else None,
-            "submitted_at": sc["submitted_at"].strftime("%Y-%m-%d %H:%M:%S") if sc and sc["submitted_at"] else None,
-        })
-
-    return {"exam_title": exam["title"], "rows": result}
-
-
-@router.get("/api/teacher/scores/export")
-def export_scores(exam_id: int = Query(...), authorization: Optional[str] = Header(None)):
-    """导出成绩 Excel"""
-    require_teacher(authorization)
-
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT title FROM exams WHERE id = %s", (exam_id,))
-        exam = cur.fetchone()
-        if not exam:
-            raise HTTPException(status_code=404, detail="考试不存在")
-
-        students = _list_students_with_class(conn)
-
-        cur.execute("""
-            SELECT sub.student_user_id, gr.exam_score AS score, gr.total_score AS total, gr.graded_at AS submitted_at
-            FROM grading_records gr
-            JOIN submissions sub ON gr.submission_id = sub.id
-            JOIN assignments a ON sub.assignment_id = a.id
-            WHERE a.title LIKE CONCAT('exam_', %s, '%%')
-        """, (exam_id,))
-        scores_map = {r["student_user_id"]: r for r in cur.fetchall()}
-
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = exam["title"][:31]
-
-    header_fill = PatternFill("solid", fgColor="4472C4")
-    header_font = Font(bold=True, color="FFFFFF")
-    headers = ["姓名", "学号", "班级", "得分", "满分", "提交时间"]
-    col_widths = [12, 14, 20, 8, 8, 20]
-
-    for col, (h, w) in enumerate(zip(headers, col_widths), 1):
-        cell = ws.cell(row=1, column=col, value=h)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center")
-        ws.column_dimensions[cell.column_letter].width = w
-
-    for row_idx, s in enumerate(students, 2):
-        sc = scores_map.get(s["user_id"])
-        ws.cell(row=row_idx, column=1, value=s["name"])
-        ws.cell(row=row_idx, column=2, value=s["student_id"])
-        ws.cell(row=row_idx, column=3, value=s["class_name"])
-        ws.cell(row=row_idx, column=4, value=float(sc["score"]) if sc else "")
-        ws.cell(row=row_idx, column=5, value=float(sc["total"]) if sc else "")
-        ws.cell(row=row_idx, column=6,
-                value=sc["submitted_at"].strftime("%Y-%m-%d %H:%M:%S") if sc and sc["submitted_at"] else "")
-        if not sc:
-            for col in range(1, 7):
-                ws.cell(row=row_idx, column=col).font = Font(color="999999")
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-
-    date_str = datetime.now().strftime("%Y%m%d")
-    filename = f"成绩单_{exam['title']}_{date_str}.xlsx"
-    encoded_filename = quote(filename, safe="")
-
-    return StreamingResponse(
-        buf,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"}
-    )
-
-
 @router.post("/api/teacher/exams/cleanup")
 def cleanup_exams(req: CleanupRequest, authorization: Optional[str] = Header(None)):
-    """删除指定标题的考试（慎用）。若未提供 titles，则删除已知的三条错误记录。"""
     require_teacher(authorization)
     defaults = [
         "第 12 章 机器人系统开发环境配置 测验",
@@ -499,7 +724,6 @@ def cleanup_exams(req: CleanupRequest, authorization: Optional[str] = Header(Non
 
 @router.delete("/api/teacher/exams/{exam_id}")
 def delete_exam(exam_id: str, authorization: Optional[str] = Header(None)):
-    """删除某次考试及其相关记录（scores、classroom_exams、questions、attempts）。"""
     require_teacher(authorization)
     affected = 0
     with db() as conn:
@@ -522,7 +746,6 @@ def delete_exam(exam_id: str, authorization: Optional[str] = Header(None)):
 
 @router.get("/api/teacher/github-bindings/summary")
 def get_binding_summary(authorization: Optional[str] = Header(None)):
-    """获取全班绑定状态汇总统计"""
     require_teacher(authorization)
     with db() as conn:
         total = conn.execute(
@@ -545,7 +768,6 @@ def get_binding_list(
     sort_by_status: bool = Query(False),
     authorization: Optional[str] = Header(None)
 ):
-    """获取全班学生 GitHub 绑定状态列表，支持筛选、搜索、排序"""
     require_teacher(authorization)
 
     with db() as conn:
@@ -606,7 +828,6 @@ class BatchStudentIds(BaseModel):
 
 @router.post("/api/teacher/github-bindings/batch-approve")
 def batch_approve_bindings(req: BatchStudentIds, authorization: Optional[str] = Header(None)):
-    """一键批量通过待审核的绑定请求"""
     require_teacher(authorization)
     if not req.student_ids:
         raise HTTPException(status_code=422, detail="请选择至少一名学生")
@@ -623,7 +844,6 @@ def batch_approve_bindings(req: BatchStudentIds, authorization: Optional[str] = 
 
 @router.post("/api/teacher/github-bindings/reject")
 def reject_binding(req: BatchStudentIds, authorization: Optional[str] = Header(None)):
-    """拒绝绑定申请"""
     require_teacher(authorization)
     if not req.student_ids:
         raise HTTPException(status_code=422, detail="请选择至少一名学生")
@@ -640,7 +860,6 @@ def reject_binding(req: BatchStudentIds, authorization: Optional[str] = Header(N
 
 @router.post("/api/teacher/github-bindings/send-reminder")
 def send_binding_reminder(req: BatchStudentIds, authorization: Optional[str] = Header(None)):
-    """向未绑定学生批量发送提醒"""
     require_teacher(authorization)
     if not req.student_ids:
         raise HTTPException(status_code=422, detail="请选择至少一名学生")
@@ -669,7 +888,6 @@ HEATMAP_STATUS = {
 
 
 class ProgressFilter(BaseModel):
-    """进度看板筛选参数"""
     course_id: Optional[int] = None
     semester: Optional[str] = None
     top_n_lowest: Optional[int] = 5
@@ -681,7 +899,6 @@ def get_progress_heatmap(
     semester: Optional[str] = Query(None),
     authorization: Optional[str] = Header(None)
 ):
-    """获取热力图数据：学生（行）× 任务（列）二维完成状态矩阵"""
     require_teacher(authorization)
 
     with db() as conn:
@@ -803,7 +1020,6 @@ def get_progress_chart(
     semester: Optional[str] = Query(None),
     authorization: Optional[str] = Header(None)
 ):
-    """获取柱状图数据：各任务在全班的完成率趋势"""
     require_teacher(authorization)
 
     with db() as conn:
@@ -875,7 +1091,6 @@ def get_progress_matrix(
     sort_order: str = Query("completion_asc", description="排序方式"),
     authorization: Optional[str] = Header(None)
 ):
-    """获取完整的进度矩阵数据，包含排序（完成率最低的前N名置顶高亮）"""
     require_teacher(authorization)
 
     heatmap_data = get_progress_heatmap(course_id=course_id, semester=semester, authorization=authorization)
@@ -972,77 +1187,4 @@ def get_progress_matrix(
     return {
         "students": students,
         "exams": exams,
-        "matrix": heatmap_data["matrix"]
     }
-
-
-@router.get("/api/teacher/progress/submission/{student_user_id}/{assignment_id}")
-def get_submission_detail(
-    student_user_id: int,
-    assignment_id: int,
-    authorization: Optional[str] = Header(None)
-):
-    """获取学生某任务的提交详情"""
-    require_teacher(authorization)
-
-    with db() as conn:
-        student = conn.execute("""
-            SELECT s.user_id AS student_id, u.full_name AS name,
-                   u.student_no, COALESCE(s.class_name, '') AS class_name
-            FROM students s
-            JOIN users u ON s.user_id = u.id
-            WHERE u.role = 'student' AND s.user_id = %s
-        """, (student_user_id,)).fetchone()
-
-        if not student:
-            raise HTTPException(status_code=404, detail="学生不存在")
-
-        assignment = conn.execute("""
-            SELECT a.id, a.title, a.deadline, a.description_md, a.late_policy,
-                   c.name AS course_name
-            FROM assignments a
-            JOIN courses c ON a.course_id = c.id
-            WHERE a.id = %s
-        """, (assignment_id,)).fetchone()
-
-        if not assignment:
-            raise HTTPException(status_code=404, detail="作业不存在")
-
-        submission = conn.execute("""
-            SELECT id, version_no, is_late, submitted_at, grading_status,
-                   file_url, text_content
-            FROM submissions
-            WHERE assignment_id = %s AND student_user_id = %s
-            ORDER BY version_no DESC
-            LIMIT 1
-        """, (assignment_id, student_user_id)).fetchone()
-
-        return {
-            "student": dict(student),
-            "assignment": {
-                "id": assignment["id"],
-                "title": assignment["title"],
-                "deadline": assignment["deadline"].isoformat() if assignment["deadline"] else None,
-                "description": assignment["description_md"],
-                "late_policy": assignment["late_policy"],
-                "course_name": assignment["course_name"]
-            },
-            "submission": dict(submission) if submission else None
-        }
-
-
-@router.get("/api/teacher/progress/courses")
-def get_progress_courses(
-    authorization: Optional[str] = Header(None)
-):
-    """获取可用于进度看板筛选的课程列表"""
-    require_teacher(authorization)
-
-    with db() as conn:
-        courses = conn.execute("""
-            SELECT id, code, name, term
-            FROM courses
-            ORDER BY term DESC, code
-        """).fetchall()
-
-    return {"courses": [dict(c) for c in courses]}

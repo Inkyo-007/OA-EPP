@@ -1,9 +1,13 @@
-import pymysql
 import os
+import pymysql
 import re
 from contextlib import contextmanager
 from urllib.parse import urlparse, unquote
 from pathlib import Path
+from dotenv import load_dotenv
+
+# 加载环境变量
+load_dotenv()
 
 # 加载 .env 文件（从项目根目录）
 _env_file = Path(__file__).resolve().parent.parent.parent / ".env"
@@ -17,6 +21,26 @@ if _env_file.exists():
                     os.environ[key] = value
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+# 判断是否在 Docker 容器环境中运行
+def is_docker_env():
+    """检测是否在 Docker 容器中运行
+    通过检查常见的 Docker 环境特征来判断
+    """
+    # 方式1：检查 /.dockerenv 文件
+    if os.path.exists("/.dockerenv"):
+        return True
+    # 方式2：检查 /proc/1/cgroup 文件中是否包含 docker
+    try:
+        with open("/proc/1/cgroup", "r") as f:
+            if "docker" in f.read():
+                return True
+    except:
+        pass
+    # 方式3：检查环境变量
+    if os.environ.get("DOCKER_CONTAINER", "") == "true":
+        return True
+    return False
 
 # 兼容旧的环境变量配置方式
 MYSQL_HOST = os.environ.get("MYSQL_HOST", "").strip()
@@ -82,13 +106,23 @@ def _parse_db_url():
             }
         except Exception:
             pass
+
     # fallback to individual env vars
+    if is_docker_env():
+        # Docker 生产环境：使用容器网络内部主机名
+        default_host = "oaepp-mysql"
+        default_port = 3306
+    else:
+        # 本地开发环境：使用公网可访问地址
+        default_host = "156.239.252.40"
+        default_port = 13306
+
     return {
-        "host": os.environ.get("DB_HOST", MYSQL_HOST or "127.0.0.1"),
-        "port": int(os.environ.get("DB_PORT", str(MYSQL_PORT))),
-        "user": os.environ.get("DB_USER", MYSQL_USER),
-        "password": os.environ.get("DB_PASSWORD", MYSQL_PASSWORD),
-        "database": os.environ.get("DB_NAME", MYSQL_DATABASE),
+        "host": os.environ.get("MYSQL_HOST", os.environ.get("DB_HOST", default_host)),
+        "port": int(os.environ.get("MYSQL_PORT", os.environ.get("DB_PORT", default_port))),
+        "user": os.environ.get("MYSQL_USER", os.environ.get("DB_USER", "student_dev")),
+        "password": os.environ.get("MYSQL_PASSWORD", os.environ.get("DB_PASSWORD", "OaEpp@Dev2026")),
+        "database": os.environ.get("MYSQL_DATABASE", os.environ.get("DB_NAME", "oaepp_dev")),
         "charset": "utf8mb4",
     }
 
@@ -101,6 +135,7 @@ def get_connection():
 
 @contextmanager
 def db():
+    """数据库连接上下文管理器"""
     conn = get_connection()
     cursor = conn.cursor(pymysql.cursors.DictCursor)
     try:
@@ -397,6 +432,14 @@ def init_db():
 
         _migrate_chapters(conn)
         _migrate_courses(conn)
+
+        # 兼容旧版本：打印表名（可选）
+        try:
+            conn.execute("SHOW TABLES")
+            tables = [list(t.values())[0] for t in conn.fetchall()]
+            print(f"当前数据库表: {tables}")
+        except Exception:
+            pass
 
     # Insert default settings
     try:

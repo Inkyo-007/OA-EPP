@@ -6,25 +6,10 @@ from app.auth_utils import verify_student_token
 
 router = APIRouter()
 
-# 远程数据库常量
-COURSE_ID = 2       # 嵌入式系统综合实践
-TEACHER_ID = 14     # 教师 李明
-
 
 class SubmitRequest(BaseModel):
     score: float
     total: float
-
-
-def _get_user_id(conn, student_no: str) -> Optional[int]:
-    """通过 student_no 获取 user_id"""
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id FROM users WHERE role = 'student' AND student_no = %s",
-        (student_no,)
-    )
-    row = cur.fetchone()
-    return row["id"] if row else None
 
 
 @router.post("/api/exam/submit")
@@ -46,21 +31,40 @@ def submit_score(req: SubmitRequest, authorization: Optional[str] = Header(None)
         raise HTTPException(status_code=422, detail="成绩数据无效")
 
     with db() as conn:
-        # 再次确认未提交（防止并发重复）
-        existing = conn.execute(
-            "SELECT id FROM scores WHERE student_id = %s AND exam_id = %s",
-            (student_id, exam_id)
-        ).fetchone()
-        if existing:
-            raise HTTPException(status_code=409, detail="您已经提交过本次考试的成绩")
+        cursor = conn.cursor()
+        
+        # 获取学生 user_id
+        cursor.execute("SELECT id FROM users WHERE student_no = %s AND role = 'student'", (student_id,))
+        user = cursor.fetchone()
+        if not user:
+            raise HTTPException(status_code=404, detail="学生不存在")
+        
+        user_id = user["id"]
+        
+        # 查找考试
+        cursor.execute("SELECT id, course_id FROM exams WHERE id = %s", (int(exam_id),))
+        exam = cursor.fetchone()
+        if not exam:
+            raise HTTPException(status_code=404, detail="考试不存在")
+        
+        exam_db_id = exam["id"]
+        course_id = exam["course_id"]
+        
+        # 创建考试尝试记录
+        cursor.execute("""
+            INSERT INTO exam_attempts (exam_id, student_user_id, status, total_score, submitted_at)
+            VALUES (%s, %s, 'submitted', %s, NOW())
+        """, (exam_db_id, user_id, req.score))
+        
+        attempt_id = cursor.lastrowid
+        
+        # 添加成绩记录
+        cursor.execute("""
+            INSERT INTO score_items (course_id, student_user_id, score_type, ref_id, score, scored_by, scored_at)
+            VALUES (%s, %s, 'exam', %s, %s, NULL, NOW())
+        """, (course_id, user_id, attempt_id, req.score))
 
-        conn.execute(
-            "INSERT INTO scores (student_id, exam_id, score, total) VALUES (%s,%s,%s,%s)",
-            (student_id, exam_id, req.score, req.total)
-        )
-
-    return {"ok": True, "student_id": student_id, "exam_id": exam_id,
-            "score": req.score, "total": req.total}
+    return {"ok": True, "student_id": student_id, "exam_id": exam_id, "score": req.score, "total": req.total}
 
 
 @router.get("/api/scores")
@@ -76,36 +80,44 @@ def get_scores(authorization: Optional[str] = Header(None)):
 
     student_id = payload["student_id"]
     with db() as conn:
-        student = conn.execute(
-            "SELECT name, student_id, class_name FROM students WHERE student_id = %s",
-            (student_id,)
-        ).fetchone()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT u.full_name as name, u.student_no as student_id, s.class_name
+            FROM users u
+            JOIN students s ON u.id = s.user_id
+            WHERE u.student_no = %s AND u.role = 'student'
+        """, (student_id,))
+        student = cursor.fetchone()
+        
         if not student:
             raise HTTPException(status_code=404, detail="学号不存在")
 
-        exams = conn.execute("SELECT id, title FROM exams ORDER BY id").fetchall()
-        scores_map = {
-            row["exam_id"]: dict(row)
-            for row in conn.execute(
-                "SELECT exam_id, score, total, submitted_at FROM scores WHERE student_id = %s",
-                (student_id,)
-            ).fetchall()
-        }
+        cursor.execute("SELECT id, title FROM exams ORDER BY id")
+        exams = cursor.fetchall()
+
+        # 获取成绩记录
+        cursor.execute("""
+            SELECT ea.exam_id, ea.total_score as score, ea.total_score as total, ea.submitted_at
+            FROM exam_attempts ea
+            JOIN users u ON ea.student_user_id = u.id
+            WHERE u.student_no = %s
+        """, (student_id,))
+        scores_data = cursor.fetchall()
+        scores_map = {s["exam_id"]: s for s in scores_data}
 
     result = []
     for exam in exams:
-        eid = str(exam["id"])
-        s = scores_map.get(eid)
+        s = scores_map.get(exam["id"])
         result.append({
-            "exam_id": eid,
+            "exam_id": str(exam["id"]),
             "exam_title": exam["title"],
-            "exam_type": exam.get("exam_type", ""),
-            "score": float(s["score"]) if s else None,
-            "total": float(s["total"]) if s else None,
-            "submitted_at": s["submitted_at"].strftime("%Y-%m-%d %H:%M:%S") if s and s["submitted_at"] else None,
+            "score": s["score"] if s else None,
+            "total": s["total"] if s else None,
+            "submitted_at": s["submitted_at"] if s else None,
         })
 
     return {
-        "student": {"name": student["name"], "student_id": student["student_id"], "class_name": student["class_name"]},
+        "student": dict(student),
         "scores": result,
     }
