@@ -1,16 +1,16 @@
-from datetime import datetime, timedelta
-from typing import Optional
-
+from datetime import datetime as _dt
 from fastapi import APIRouter, HTTPException, Header
+from typing import Optional
 from pydantic import BaseModel
-
-from app.auth_utils import create_token, hash_password, verify_password, verify_student_token
 from app.database import db
+from app.auth_utils import create_token, verify_password, verify_token
 
 router = APIRouter()
 
-MAX_FAILED_LOGIN = 5
-LOCK_MINUTES = 5
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
 
 
 class VerifyRequest(BaseModel):
@@ -18,127 +18,82 @@ class VerifyRequest(BaseModel):
     exam_id: str
 
 
-class LoginRequest(BaseModel):
-    identifier: str
-    password: str
-
-
-def _parse_locked_until(value: str) -> Optional[datetime]:
-    if not value:
-        return None
+def _require_auth(authorization: Optional[str]) -> dict:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="请先登录")
+    token = authorization.removeprefix("Bearer ").strip()
     try:
-        return datetime.fromisoformat(value)
-    except ValueError:
-        try:
-            return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            return None
+        return verify_token(token)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
+def _row(conn, sql, params):
+    r = conn.execute(sql, params).fetchone()
+    if r is None:
+        return None
+    if isinstance(r, dict):
+        return r
+    return dict(r._mapping)
 
 
 @router.post("/api/auth/login")
 def login(req: LoginRequest):
-    identifier = req.identifier.strip()
-    password = req.password or ""
-    if not identifier or not password:
-        raise HTTPException(status_code=422, detail="学号/邮箱和密码不能为空")
-
-    lookup = identifier.lower()
     with db() as conn:
-        account = conn.execute(
-            """
-            SELECT a.student_id, a.password_hash, a.failed_attempts, a.locked_until,
-                   s.name, s.class_name
-            FROM student_accounts a
-            JOIN students s ON s.student_id = a.student_id
-            WHERE lower(a.student_id) = ? OR lower(a.email) = ?
-            """,
-            (lookup, lookup),
-        ).fetchone()
+        user = _row(conn,
+            "SELECT id, role, email, password_hash, full_name, is_active, locked_until "
+            "FROM users WHERE email = %s",
+            (req.email,))
 
-        if not account:
-            student = conn.execute(
-                "SELECT name, student_id, class_name FROM students WHERE lower(student_id) = ?",
-                (lookup,),
-            ).fetchone()
-            if not student:
-                raise HTTPException(status_code=401, detail="学号/邮箱或密码错误")
-            password_hash = hash_password(student["student_id"])
+    if not user:
+        raise HTTPException(status_code=401, detail="邮箱或密码错误")
+
+    if not user["is_active"]:
+        raise HTTPException(status_code=403, detail="账号已被禁用")
+
+    if user["locked_until"] and user["locked_until"] > _dt.utcnow():
+        raise HTTPException(status_code=423, detail="账号已被锁定，请稍后再试")
+
+    if not verify_password(req.password, user["password_hash"]):
+        with db() as conn:
             conn.execute(
-                "INSERT INTO student_accounts (student_id, password_hash) VALUES (?, ?)",
-                (student["student_id"], password_hash),
-            )
-            account = conn.execute(
-                "SELECT a.student_id, a.password_hash, a.failed_attempts, a.locked_until, s.name, s.class_name "
-                "FROM student_accounts a JOIN students s ON s.student_id = a.student_id "
-                "WHERE lower(a.student_id) = ? OR lower(a.email) = ?",
-                (lookup, lookup),
-            ).fetchone()
+                "UPDATE users SET login_fail_cnt = login_fail_cnt + 1 WHERE id = %s",
+                (user["id"],))
+        raise HTTPException(status_code=401, detail="邮箱或密码错误")
 
-        locked_until = _parse_locked_until(account["locked_until"])
-        now = datetime.utcnow()
-        if locked_until and locked_until > now:
-            remaining = int((locked_until - now).total_seconds() // 60) + 1
-            raise HTTPException(
-                status_code=403,
-                detail=f"连续登录失败已达 {MAX_FAILED_LOGIN} 次，账户已暂时锁定 {remaining} 分钟"
-            )
-
-        if not verify_password(password, account["password_hash"]):
-            failed_attempts = account["failed_attempts"] + 1
-            if failed_attempts >= MAX_FAILED_LOGIN:
-                new_locked_until = (now + timedelta(minutes=LOCK_MINUTES)).isoformat(timespec="seconds")
-                conn.execute(
-                    "UPDATE student_accounts SET failed_attempts = ?, locked_until = ? WHERE student_id = ?",
-                    (failed_attempts, new_locked_until, account["student_id"]),
-                )
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"连续登录失败已达 {MAX_FAILED_LOGIN} 次，账户已锁定 {LOCK_MINUTES} 分钟"
-                )
-
-            conn.execute(
-                "UPDATE student_accounts SET failed_attempts = ? WHERE student_id = ?",
-                (failed_attempts, account["student_id"]),
-            )
-            raise HTTPException(status_code=401, detail="学号/邮箱或密码错误")
-
+    with db() as conn:
         conn.execute(
-            "UPDATE student_accounts SET failed_attempts = 0, locked_until = '' WHERE student_id = ?",
-            (account["student_id"],),
-        )
+            "UPDATE users SET login_fail_cnt = 0, locked_until = NULL WHERE id = %s",
+            (user["id"],))
 
-        token = create_token(
-            {
-                "role": "student",
-                "student_id": account["student_id"],
-                "name": account["name"],
-            },
-            expires_hours=2,
-        )
+    token = create_token({
+        "user_id": user["id"],
+        "role": user["role"],
+        "email": user["email"],
+        "full_name": user["full_name"],
+    }, expires_hours=8)
 
     return {
-        "ok": True,
-        "student_id": account["student_id"],
-        "name": account["name"],
         "token": token,
+        "user": {
+            "id": user["id"],
+            "role": user["role"],
+            "email": user["email"],
+            "full_name": user["full_name"],
+        }
     }
 
 
 @router.get("/api/auth/me")
-def me(authorization: Optional[str] = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="未登录")
-
-    token = authorization.removeprefix("Bearer ").strip()
-    try:
-        payload = verify_student_token(token)
-    except ValueError as exc:
-        raise HTTPException(status_code=401, detail=str(exc))
-
-    return {
-        "student_id": payload["student_id"],
-        "name": payload["name"],
-    }
+def get_me(authorization: Optional[str] = Header(None)):
+    payload = _require_auth(authorization)
+    with db() as conn:
+        user = _row(conn,
+            "SELECT id, role, email, full_name, student_no FROM users WHERE id = %s",
+            (payload["user_id"],))
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return user
 
 
 @router.post("/api/auth/logout")
@@ -149,42 +104,24 @@ def logout():
 @router.post("/api/auth/verify")
 def verify_identity(req: VerifyRequest):
     """
-    核验学生身份并检查是否已提交成绩。
-    - 学号不存在 → 403
-    - 已提交 → {already_submitted: true, score, total, submitted_at}
-    - 未提交 → {already_submitted: false, token}
+    核验学生身份并检查是否已提交成绩，返回 token 供参加考试。
     """
     with db() as conn:
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT u.full_name as name, u.student_no as student_id, s.class_name, u.id as user_id
-            FROM users u
-            JOIN students s ON u.id = s.user_id
-            WHERE u.student_no = %s AND u.role = 'student'
-        """, (req.student_id,))
-        student = cursor.fetchone()
+        student = _row(conn,
+            "SELECT u.full_name as name, u.student_no as student_id, s.class_name, u.id as user_id "
+            "FROM users u JOIN students s ON u.id = s.user_id "
+            "WHERE u.student_no = %s AND u.role = 'student'",
+            (req.student_id,))
 
         if not student:
             raise HTTPException(status_code=403, detail="学号不在名单中，请联系老师确认")
 
-        cursor.execute("SELECT id, title FROM exams WHERE id = %s", (int(req.exam_id),))
-        exam = cursor.fetchone()
+        exam = _row(conn,
+            "SELECT id, title FROM exams WHERE id = %s",
+            (req.exam_id,))
 
         if not exam:
             raise HTTPException(status_code=404, detail="考试不存在")
-
-        # 检查是否已提交 - 暂时没有成绩记录功能
-        existing = None
-
-        if existing:
-            return {
-                "already_submitted": True,
-                "name": student["name"],
-                "score": None,
-                "total": None,
-                "submitted_at": None,
-            }
 
         token = create_token({
             "role": "student",
