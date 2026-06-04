@@ -9,14 +9,15 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends nginx ca-certificates \
+    && apt-get install -y --no-install-recommends nginx ca-certificates unzip \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
 RUN pip install -r /app/requirements.txt
 
 COPY . /app
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+RUN rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf
+COPY nginx.conf /etc/nginx/conf.d/oaepp_reflex.conf
 COPY start.sh /start.sh
 RUN chmod +x /start.sh
 
